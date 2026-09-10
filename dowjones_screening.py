@@ -247,8 +247,8 @@ def login(page, base_url: str):
             if not saw_oauthcallback:
                 saw_oauthcallback = True
                 log("  检测到 oauthcallback (已获 code), 等待 SPA 处理")
-                # 等待 SPA 自行处理 code 交换 (最多 15 秒)
-                for _ in range(30):
+                # 等待 SPA 自行处理 code 交换 (最多 30 秒, 网络慢时需更长)
+                for _ in range(60):
                     page.wait_for_timeout(500)
                     cur = (page.url or "").lower()
                     if "riskcenter.dowjones.com" in cur and "oauthcallback" not in cur and "login" not in cur and "signin" not in cur:
@@ -263,8 +263,8 @@ def login(page, base_url: str):
                         page.reload(wait_until="domcontentloaded", timeout=TIMEOUT_MS)
                     except Exception:
                         pass
-                    # reload 后等待 SPA 处理 (最多 30 秒, 网络慢时 code 交换 XHR 需较长时间)
-                    for _ in range(60):
+                    # reload 后等待 SPA 处理 (最多 45 秒)
+                    for _ in range(90):
                         page.wait_for_timeout(500)
                         cur = (page.url or "").lower()
                         if "riskcenter.dowjones.com" in cur and "oauthcallback" not in cur and "login" not in cur and "signin" not in cur:
@@ -272,20 +272,23 @@ def login(page, base_url: str):
                             break
                     if landed:
                         break
-                    # reload 仍未跳走 → 直接导航到 dashboard (SSO 可能已写入 session cookie)
+                    # reload 仍未跳走 → 直接导航到搜索页 (可能触发 code 交换)
                     if "oauthcallback" in (page.url or "").lower():
-                        log("  reload 无效, 直接导航到 dashboard (依赖已设置的 session cookie)")
+                        log("  reload 无效, 导航到搜索页重试")
                         try:
-                            page.goto(DJ_BASE_URL + "/dashboard", wait_until="domcontentloaded", timeout=TIMEOUT_MS)
+                            page.goto(DJ_ADVANCED_SEARCH_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
                         except Exception:
                             pass
-                        page.wait_for_timeout(3000)
+                        page.wait_for_timeout(5000)
                         cur = (page.url or "").lower()
-                        if "riskcenter.dowjones.com" in cur and "oauthcallback" not in cur:
+                        if "riskcenter.dowjones.com" in cur and "oauthcallback" not in cur and "login" not in cur and "signin" not in cur:
                             landed = True
                             break
                     continue
         page.wait_for_timeout(500)
+    # 严格判定: 仍在 oauthcallback 则视为未登录
+    if "oauthcallback" in (page.url or "").lower():
+        raise RuntimeError("登录后仍停留在 oauthcallback, code 交换失败")
     if not landed and not _is_logged_in(page):
         raise RuntimeError("登录后未跳转回 riskcenter, 可能凭据失效或出现验证码/2FA")
 
@@ -568,36 +571,25 @@ def stabilize_for_pdf(page):
 def click_print_button(page, context=None):
     """点击页面上的 Print 按钮, 触发打印预览, 返回用于生成 PDF 的 page。
 
-    流程:
-    1. 拦截 window.print() (headless 模式下原生 print 会阻塞, 改为标记)
-    2. 点击 Print 按钮 (用 JS click 避免 overlay 拦截)
-    3. 若弹出确认对话框 (含 "Continue"/"Print" 按钮), 点击继续
-    4. 若弹出新 tab, 返回新 tab 的 page (打印预览在新 tab 中)
-    5. 否则返回当前 page, 由 page.pdf() 用 print media CSS 生成 PDF
+    Dow Jones Risk Center 的 Print 流程:
+    1. 点击 Print 按钮 (aria-label="Print" 或含 "Print" 文字)
+    2. 弹出确认对话框 (含打印选项: profile+summary / profile only / summary only)
+    3. 点击对话框中的 "Continue" 按钮
+    4. 打开新 tab (URL 含 /search/print), 该 tab 内容即打印预览
+    5. 返回新 tab 的 page 用于生成 PDF
 
     返回: (target_page, used_print_button)
     """
-    # 拦截 window.print(): headless 模式下原生 print 对话框无法显示且会阻塞,
-    # 改为标记被调用, 后续由 page.pdf() 用 print media CSS 生成 PDF
-    try:
-        page.evaluate("""
-            window.__printTriggered = false;
-            window.print = function() {
-                window.__printTriggered = true;
-            };
-        """)
-    except Exception:
-        pass
-
-    # 查找 Print 按钮 (排除页面其他含 "print" 文字的元素, 优先 button/svg 图标按钮)
+    # 查找 Print 按钮: 优先 aria-label="Print" (详情页的图标按钮无可见文字),
+    # 其次含 "Print" 文字的按钮 (搜索结果页的文字按钮)
     print_selectors = [
+        'button[aria-label="Print"]',
+        'button[aria-label*="print" i]',
+        'a[aria-label*="print" i]',
         'button:has-text("Print")',
         'a:has-text("Print")',
         '[role="button"]:has-text("Print")',
-        'button[aria-label*="print" i]',
-        'a[aria-label*="print" i]',
         'button[title*="print" i]',
-        'a[title*="print" i]',
         '[data-testid*="print" i]',
     ]
     print_btn = None
@@ -614,126 +606,122 @@ def click_print_button(page, context=None):
         log("  未找到 Print 按钮, 直接 page.pdf()")
         return page, False
 
-    # 监听新 tab 打开
-    new_pages = []
-    if context:
-        def _on_new_page(np):
-            new_pages.append(np)
-        context.on("page", _on_new_page)
-
-    # 直接用 JS click 避免 overlay 拦截导致的 5s 超时
+    # 用 native click 点击 Print 按钮 (JS click 可能不触发 React 事件处理器)
     log("  找到 Print 按钮, 点击")
     try:
-        page.evaluate("""() => {
-            const btns = document.querySelectorAll('button, a, [role="button"]');
-            for (const b of btns) {
-                const t = (b.innerText || b.textContent || '').trim();
-                if (t.toLowerCase() === 'print') {
-                    b.click();
-                    return true;
-                }
-            }
-            // 回退: 含 print 的按钮
-            for (const b of btns) {
-                const t = (b.innerText || b.textContent || '').trim();
-                if (t.toLowerCase().includes('print')) {
-                    b.click();
-                    return true;
-                }
-            }
-            return false;
-        }""")
-    except Exception as e:
-        log(f"  Print 按钮 JS click 异常: {e}")
+        print_btn.click(timeout=5000)
+    except Exception:
+        try:
+            print_btn.click(force=True, timeout=5000)
+        except Exception:
+            # 回退: JS click
+            try:
+                page.evaluate("""() => {
+                    const btns = document.querySelectorAll('button, a, [role="button"]');
+                    for (const b of btns) {
+                        const aria = b.getAttribute('aria-label') || '';
+                        const t = (b.innerText || b.textContent || '').trim();
+                        if (aria.toLowerCase() === 'print' || t.toLowerCase() === 'print') {
+                            b.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }""")
+            except Exception as e:
+                log(f"  Print 按钮点击失败: {e}")
+                return page, False
 
-    page.wait_for_timeout(2000)
+    page.wait_for_timeout(1500)
 
-    # 检查是否有新 tab 打开 (打印预览在新 tab)
-    if new_pages:
-        log("  Print 按钮打开了新 tab, 使用新 tab 生成 PDF")
-        new_page = new_pages[0]
+    # 点击 Continue 按钮 (在弹出的对话框中), 并用 expect_page 捕获新 tab
+    new_page = _click_continue_and_capture_new_tab(page, context)
+    if new_page is not None:
+        log("  Continue 后打开了新 tab, 使用新 tab 生成 PDF")
         try:
             new_page.wait_for_load_state("domcontentloaded", timeout=15000)
         except Exception:
             pass
+        page.wait_for_timeout(1500)
         return new_page, True
 
-    # 检查并点击确认对话框上的 "Continue"/"Print" 按钮 (Dow Jones 弹出确认框)
-    continue_clicked = _click_continue_in_dialog(page)
-    if continue_clicked:
-        page.wait_for_timeout(2000)
-        # 再次检查新 tab (点击 Continue 后可能打开新 tab)
-        if new_pages:
-            log("  Continue 后打开了新 tab, 使用新 tab 生成 PDF")
-            new_page = new_pages[0]
-            try:
-                new_page.wait_for_load_state("domcontentloaded", timeout=15000)
-            except Exception:
-                pass
-            return new_page, True
-
-    # 检查 window.print() 是否被调用
-    try:
-        triggered = page.evaluate("() => window.__printTriggered === true")
-        if triggered:
-            log("  window.print() 已触发, 用 print media CSS 生成 PDF")
-    except Exception:
-        pass
-
-    # 检查是否有 modal/popup 弹出 (打印预览在当前页 modal 中)
-    try:
-        modals = page.evaluate("""() => {
-            const modals = document.querySelectorAll(
-                '[class*="modal" i], [class*="dialog" i], [class*="popup" i], [role="dialog"], [class*="overlay" i]'
-            );
-            return Array.from(modals).filter(m => m.offsetParent !== null || m.offsetWidth > 0).length;
-        }""")
-        if modals > 0:
-            log("  Print 按钮弹出了 modal/popup, 在当前页用 print media 生成 PDF")
-    except Exception:
-        pass
-
+    # 回退: 未弹出新 tab, 在当前页用 print media CSS 生成 PDF
+    log("  未打开新 tab, 在当前页用 print media 生成 PDF")
     return page, True
 
 
-def _click_continue_in_dialog(page):
-    """在 Print 按钮弹出的确认对话框上点击 "Continue"/"Print" 按钮以触发打印预览。
-    返回是否点击了继续按钮。
+def _click_continue_and_capture_new_tab(page, context=None):
+    """点击对话框中的 Continue 按钮, 并捕获打开的新 tab。
+    返回新 tab 的 page 对象, 若未打开新 tab 则返回 None。
     """
-    # 确认对话框按钮文案: Continue / Print / OK / Confirm / Yes
-    continue_selectors = [
+    # 先等待 dialog 出现
+    dialog = None
+    try:
+        dialog = page.locator('[role="dialog"]').first
+        dialog.wait_for(state="visible", timeout=5000)
+    except Exception:
+        pass
+
+    # 在 dialog 范围内找 Continue 按钮, 避免点到页面其他按钮
+    container = dialog if dialog is not None else page
+    continue_btn = None
+    for sel in [
         'button:has-text("Continue")',
         'button:has-text("Print")',
         'button:has-text("OK")',
         'button:has-text("Confirm")',
-        'button:has-text("Yes")',
-        '[role="button"]:has-text("Continue")',
-        'button[type="submit"]:has-text("Continue")',
-    ]
-    for sel in continue_selectors:
+    ]:
         try:
-            loc = page.locator(sel).first
-            if loc.is_visible(timeout=1500):
-                log(f"  点击确认对话框按钮: {sel}")
-                try:
-                    loc.click(timeout=3000)
-                except Exception:
-                    # 用 JS click 避免 overlay 拦截
-                    page.evaluate(f"""() => {{
-                        const btns = document.querySelectorAll('button, [role="button"]');
-                        for (const b of btns) {{
-                            const t = (b.innerText || b.textContent || '').trim().toLowerCase();
-                            if (t === 'continue' || t === 'print' || t === 'ok' || t === 'confirm' || t === 'yes') {{
-                                b.click();
-                                return true;
-                            }}
-                        }}
-                        return false;
-                    }}""")
-                return True
+            loc = container.locator(sel).first
+            if loc.is_visible(timeout=1000):
+                continue_btn = loc
+                break
         except Exception:
             continue
-    return False
+
+    if continue_btn is None:
+        log("  对话框中未找到 Continue 按钮")
+        return None
+
+    log(f"  点击对话框 Continue 按钮")
+
+    # 用 expect_page 捕获新 tab (必须包裹触发新页的点击动作)
+    if context is not None:
+        try:
+            with context.expect_page(timeout=15000) as new_page_info:
+                try:
+                    continue_btn.click(timeout=5000)
+                except Exception:
+                    try:
+                        continue_btn.click(force=True, timeout=5000)
+                    except Exception:
+                        # JS click (可能不触发 React 事件, 作为最后回退)
+                        page.evaluate("""() => {
+                            const dialog = document.querySelector('[role="dialog"]') || document;
+                            const btns = dialog.querySelectorAll('button, [role="button"]');
+                            for (const b of btns) {
+                                const t = (b.innerText || b.textContent || '').trim().toLowerCase();
+                                if (t === 'continue' || t === 'print' || t === 'ok' || t === 'confirm') {
+                                    b.click();
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }""")
+            return new_page_info.value
+        except Exception:
+            # expect_page 超时, 检查是否已有新 tab 打开
+            pass
+
+    # 回退: 无 context 或 expect_page 失败, 用 context.pages 检查
+    if context is not None:
+        pages = context.pages
+        if len(pages) > 1:
+            # 返回最后一个非当前页的 page
+            for p in reversed(pages):
+                if p is not page:
+                    return p
+    return None
 
 
 def dismiss_modal(page):
@@ -784,24 +772,27 @@ def save_search_result_pdf(page, input_name: str, context=None) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     path = OUTPUT_DIR / f"{sanitize(input_name)} - search result.pdf"
     stabilize_for_pdf(page)
-    # 点击页面 Print 按钮, 触发打印预览并捕获用于生成 PDF 的 page
+    # 点击页面 Print 按钮, 触发打印预览并捕获用于生成 PDF 的 page (通常是新 tab)
     target_page, used_print = click_print_button(page, context)
-    # 切换到 print media CSS, 让 page.pdf() 渲染打印预览版本 (隐藏导航/工具栏等 UI)
-    try:
-        target_page.emulate_media(media="print")
-    except Exception:
-        pass
+    # 若 target_page 是当前页 (回退情况), 切换到 print media CSS;
+    # 若是新 tab, 其内容已是打印预览, 直接 page.pdf() 即可
+    is_new_tab = target_page is not page
+    if not is_new_tab:
+        try:
+            target_page.emulate_media(media="print")
+        except Exception:
+            pass
     try:
         target_page.pdf(path=str(path), print_background=True)
     finally:
-        # 还原 screen media, 避免影响后续页面交互
-        try:
-            target_page.emulate_media(media="screen")
-        except Exception:
-            pass
+        if not is_new_tab:
+            try:
+                target_page.emulate_media(media="screen")
+            except Exception:
+                pass
     log(f"  保存搜索结果 PDF: {path}")
     # 关闭 Print 弹出的 modal/popup, 避免拦截后续操作
-    if used_print and target_page is page:
+    if used_print and not is_new_tab:
         dismiss_modal(page)
     return path
 
@@ -863,24 +854,27 @@ def save_detail_pdf(page, input_name: str, result_name: str, profile_id: str, co
     # 用 input_name (模板输入名) 命名, 与 search result PDF 保持一致
     path = OUTPUT_DIR / f"{sanitize(input_name)} - {sanitize(profile_id)}.pdf"
     stabilize_for_pdf(page)
-    # 点击页面 Print 按钮, 触发打印预览并捕获用于生成 PDF 的 page
+    # 点击页面 Print 按钮, 触发打印预览并捕获用于生成 PDF 的 page (通常是新 tab)
     target_page, used_print = click_print_button(page, context)
-    # 切换到 print media CSS, 让 page.pdf() 渲染打印预览版本 (隐藏导航/工具栏等 UI)
-    try:
-        target_page.emulate_media(media="print")
-    except Exception:
-        pass
+    # 若 target_page 是当前页 (回退情况), 切换到 print media CSS;
+    # 若是新 tab, 其内容已是打印预览, 直接 page.pdf() 即可
+    is_new_tab = target_page is not page
+    if not is_new_tab:
+        try:
+            target_page.emulate_media(media="print")
+        except Exception:
+            pass
     try:
         target_page.pdf(path=str(path), print_background=True)
     finally:
-        # 还原 screen media, 避免影响后续页面交互
-        try:
-            target_page.emulate_media(media="screen")
-        except Exception:
-            pass
+        if not is_new_tab:
+            try:
+                target_page.emulate_media(media="screen")
+            except Exception:
+                pass
     log(f"  保存详情 PDF: {path}")
     # 关闭 Print 弹出的 modal/popup, 避免拦截后续操作
-    if used_print and target_page is page:
+    if used_print and not is_new_tab:
         dismiss_modal(page)
     return path
 
