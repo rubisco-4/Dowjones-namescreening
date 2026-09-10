@@ -111,6 +111,48 @@ def login(page, base_url: str):
     log(f"打开 {base_url}")
     page.goto(base_url, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
 
+    # 设置 token exchange 请求重试路由: 网络抖动时 code 交换 XHR 易失败,
+    # 代理对 accounts.dowjones.com 的 POST 偶发超时, 改用 urllib 直连 (不走代理)
+    try:
+        import urllib.request
+        import urllib.error
+
+        def _token_route(route):
+            request = route.request
+            post_data = request.post_data or ""
+            headers = dict(request.headers)
+            # 移除可能导致问题的 header
+            for h in ["host", "content-length", "connection"]:
+                headers.pop(h, None)
+            for attempt in range(3):
+                try:
+                    req = urllib.request.Request(
+                        request.url,
+                        data=post_data.encode("utf-8") if isinstance(post_data, str) else post_data,
+                        headers=headers,
+                        method=request.method,
+                    )
+                    # 直连不走代理 (创建无 proxy 的 opener)
+                    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                    with opener.open(req, timeout=30) as resp:
+                        body = resp.read()
+                        route.fulfill(
+                            status=resp.status,
+                            headers=dict(resp.headers),
+                            body=body,
+                        )
+                    return
+                except Exception as e:
+                    if attempt < 2:
+                        log(f"  token exchange 第 {attempt+1} 次失败, 重试: {str(e)[:100]}")
+                        continue
+                    else:
+                        route.abort()
+                        return
+        page.route("**/oauth2/v1/token", _token_route)
+    except Exception:
+        pass
+
     # 1) 多跳重定向: riskcenter → accounts.dowjones.com/oauth2 → djlogin/login.asp(#okBtn)
     #    → 点击 #okBtn → sso.accounts.dowjones.com 登录表单。
     #    用轮询兼容重定向链 (wait_for / expect_navigation 会被中间跳转打断)。
@@ -568,108 +610,112 @@ def stabilize_for_pdf(page):
         pass
 
 
-def click_print_button(page, context=None):
-    """点击页面上的 Print 按钮, 触发打印预览, 返回用于生成 PDF 的 page。
+def download_pdf(page, target_path: Path, page_type: str = "detail") -> Path:
+    """点击页面 Download 按钮, 选择 PDF 格式, 下载并保存到 target_path。
 
-    Dow Jones Risk Center 的 Print 流程:
-    1. 点击 Print 按钮 (aria-label="Print" 或含 "Print" 文字)
-    2. 弹出确认对话框 (含打印选项: profile+summary / profile only / summary only)
-    3. 点击对话框中的 "Continue" 按钮
-    4. 打开新 tab (URL 含 /search/print), 该 tab 内容即打印预览
-    5. 返回新 tab 的 page 用于生成 PDF
+    Dow Jones Risk Center 的 Download 流程 (搜索结果页与详情页统一):
+      1. 点击页面上方 Download 按钮
+      2. 弹出对话框, 若有 PDF 格式选项则选择 "PDF"
+      3. 点击 "Continue" / "CONTINUE" 按钮
+      4. PDF 文件下载并保存到 target_path
 
-    返回: (target_page, used_print_button)
+    参数:
+        page: 当前页面
+        target_path: 保存目标路径
+        page_type: "search" 或 "detail"
+    返回: 保存的文件路径
     """
-    # 查找 Print 按钮: 优先 aria-label="Print" (详情页的图标按钮无可见文字),
-    # 其次含 "Print" 文字的按钮 (搜索结果页的文字按钮)
-    print_selectors = [
-        'button[aria-label="Print"]',
-        'button[aria-label*="print" i]',
-        'a[aria-label*="print" i]',
-        'button:has-text("Print")',
-        'a:has-text("Print")',
-        '[role="button"]:has-text("Print")',
-        'button[title*="print" i]',
-        '[data-testid*="print" i]',
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 查找 Download 按钮:
+    # - 详情页: button[aria-label="Download"] (图标按钮)
+    # - 搜索结果页: button:has-text("Download") 或含 file-download svg 的按钮
+    download_selectors = [
+        'button[aria-label="Download"]',
+        'button[aria-label*="download" i]',
+        'a[aria-label*="download" i]',
+        'button:has(svg[aria-label="file-download"])',
+        'button:has-text("Download")',
+        'a:has-text("Download")',
     ]
-    print_btn = None
-    for sel in print_selectors:
+    dl_btn = None
+    for sel in download_selectors:
         try:
             loc = page.locator(sel).first
             if loc.is_visible(timeout=1000):
-                print_btn = loc
+                dl_btn = loc
                 break
         except Exception:
             continue
 
-    if print_btn is None:
-        log("  未找到 Print 按钮, 直接 page.pdf()")
-        return page, False
+    if dl_btn is None:
+        # 回退: 直接找 svg[aria-label="file-download"]
+        try:
+            svg_loc = page.locator('svg[aria-label="file-download"]').first
+            if svg_loc.is_visible(timeout=1000):
+                dl_btn = svg_loc
+        except Exception:
+            pass
 
-    # 用 native click 点击 Print 按钮 (JS click 可能不触发 React 事件处理器)
-    log("  找到 Print 按钮, 点击")
+    if dl_btn is None:
+        raise RuntimeError("未找到 Download 按钮")
+
+    log(f"  找到 Download 按钮, 点击")
     try:
-        print_btn.click(timeout=5000)
+        dl_btn.click(timeout=5000)
     except Exception:
         try:
-            print_btn.click(force=True, timeout=5000)
+            dl_btn.click(force=True, timeout=5000)
         except Exception:
-            # 回退: JS click
-            try:
-                page.evaluate("""() => {
-                    const btns = document.querySelectorAll('button, a, [role="button"]');
-                    for (const b of btns) {
-                        const aria = b.getAttribute('aria-label') || '';
-                        const t = (b.innerText || b.textContent || '').trim();
-                        if (aria.toLowerCase() === 'print' || t.toLowerCase() === 'print') {
-                            b.click();
-                            return true;
-                        }
+            page.evaluate("""() => {
+                const btns = document.querySelectorAll('button, a, [role="button"]');
+                for (const b of btns) {
+                    const aria = b.getAttribute('aria-label') || '';
+                    const t = (b.innerText || b.textContent || '').trim();
+                    if (aria.toLowerCase() === 'download' || t.toLowerCase() === 'download') {
+                        b.click();
+                        return true;
                     }
-                    return false;
-                }""")
-            except Exception as e:
-                log(f"  Print 按钮点击失败: {e}")
-                return page, False
+                }
+                return false;
+            }""")
 
     page.wait_for_timeout(1500)
 
-    # 点击 Continue 按钮 (在弹出的对话框中), 并用 expect_page 捕获新 tab
-    new_page = _click_continue_and_capture_new_tab(page, context)
-    if new_page is not None:
-        log("  Continue 后打开了新 tab, 使用新 tab 生成 PDF")
-        try:
-            new_page.wait_for_load_state("domcontentloaded", timeout=15000)
-        except Exception:
-            pass
-        page.wait_for_timeout(1500)
-        return new_page, True
-
-    # 回退: 未弹出新 tab, 在当前页用 print media CSS 生成 PDF
-    log("  未打开新 tab, 在当前页用 print media 生成 PDF")
-    return page, True
-
-
-def _click_continue_and_capture_new_tab(page, context=None):
-    """点击对话框中的 Continue 按钮, 并捕获打开的新 tab。
-    返回新 tab 的 page 对象, 若未打开新 tab 则返回 None。
-    """
-    # 先等待 dialog 出现
+    # 等待 dialog 出现
     dialog = None
     try:
         dialog = page.locator('[role="dialog"]').first
         dialog.wait_for(state="visible", timeout=5000)
     except Exception:
+        # 可能无 dialog (直接下载)
         pass
 
-    # 在 dialog 范围内找 Continue 按钮, 避免点到页面其他按钮
     container = dialog if dialog is not None else page
+
+    # 选择 PDF 格式 (搜索结果页与详情页均尝试; 若无 PDF 选项则跳过, 使用默认)
+    for sel in ['text="PDF"', 'button:has-text("PDF")', '[role="radio"]:has-text("PDF")',
+                'label:has-text("PDF")', '[role="option"]:has-text("PDF")']:
+        try:
+            loc = container.locator(sel).first
+            if loc.is_visible(timeout=1000):
+                log("  选择 PDF 格式")
+                try:
+                    loc.click(timeout=3000)
+                except Exception:
+                    loc.click(force=True, timeout=3000)
+                page.wait_for_timeout(500)
+                break
+        except Exception:
+            continue
+
+    # 点击 Continue/CONTINUE 按钮触发下载
     continue_btn = None
     for sel in [
         'button:has-text("Continue")',
-        'button:has-text("Print")',
+        'button:has-text("CONTINUE")',
+        'button:has-text("Download")',
         'button:has-text("OK")',
-        'button:has-text("Confirm")',
     ]:
         try:
             loc = container.locator(sel).first
@@ -680,48 +726,92 @@ def _click_continue_and_capture_new_tab(page, context=None):
             continue
 
     if continue_btn is None:
-        log("  对话框中未找到 Continue 按钮")
-        return None
+        raise RuntimeError("对话框中未找到 Continue 按钮")
 
-    log(f"  点击对话框 Continue 按钮")
-
-    # 用 expect_page 捕获新 tab (必须包裹触发新页的点击动作)
-    if context is not None:
-        try:
-            with context.expect_page(timeout=15000) as new_page_info:
+    log("  点击 Continue 触发下载")
+    # 用 expect_download 捕获下载事件
+    try:
+        with page.expect_download(timeout=60000) as dl_info:
+            try:
+                continue_btn.click(timeout=5000)
+            except Exception:
                 try:
-                    continue_btn.click(timeout=5000)
+                    continue_btn.click(force=True, timeout=5000)
                 except Exception:
-                    try:
-                        continue_btn.click(force=True, timeout=5000)
-                    except Exception:
-                        # JS click (可能不触发 React 事件, 作为最后回退)
-                        page.evaluate("""() => {
-                            const dialog = document.querySelector('[role="dialog"]') || document;
-                            const btns = dialog.querySelectorAll('button, [role="button"]');
-                            for (const b of btns) {
-                                const t = (b.innerText || b.textContent || '').trim().toLowerCase();
-                                if (t === 'continue' || t === 'print' || t === 'ok' || t === 'confirm') {
-                                    b.click();
-                                    return true;
-                                }
+                    page.evaluate("""() => {
+                        const dialog = document.querySelector('[role="dialog"]') || document;
+                        const btns = dialog.querySelectorAll('button, [role="button"]');
+                        for (const b of btns) {
+                            const t = (b.innerText || b.textContent || '').trim().toLowerCase();
+                            if (t === 'continue' || t === 'download' || t === 'ok') {
+                                b.click();
+                                return true;
                             }
-                            return false;
-                        }""")
-            return new_page_info.value
+                        }
+                        return false;
+                    }""")
+        download = dl_info.value
+        log(f"  下载成功: {download.suggested_filename}")
+        download.save_as(str(target_path))
+    except Exception as e:
+        # 下载事件未触发, 检查是否有新 tab 打开 (PDF 在新 tab 中)
+        log(f"  expect_download 超时: {e}")
+        pages = page.context.pages if page.context else []
+        for p in reversed(pages):
+            if p is not page:
+                try:
+                    p.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:
+                    pass
+                # 尝试从新 tab 的 URL 直接下载 PDF (不使用 page.pdf 打印)
+                new_url = p.url or ""
+                if new_url.lower().endswith(".pdf") or "application/pdf" in new_url.lower():
+                    try:
+                        import urllib.request
+                        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                        req = urllib.request.Request(new_url)
+                        with opener.open(req, timeout=60) as resp:
+                            data = resp.read()
+                        with open(target_path, "wb") as f:
+                            f.write(data)
+                        log(f"  从新 tab URL 下载 PDF: {target_path}")
+                        p.close()
+                        break
+                    except Exception as e2:
+                        log(f"  从新 tab URL 下载 PDF 失败: {e2}")
+                # 回退: 检查新 tab 中是否有 iframe/embed 承载 PDF, 提取其 src 下载
+                try:
+                    pdf_src = p.evaluate("""() => {
+                        const el = document.querySelector('iframe[src*=".pdf"], embed[src*=".pdf"], object[data*=".pdf"]');
+                        if (el) return el.src || el.data;
+                        return '';
+                    }""")
+                    if pdf_src:
+                        import urllib.request
+                        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                        req = urllib.request.Request(pdf_src)
+                        with opener.open(req, timeout=60) as resp:
+                            data = resp.read()
+                        with open(target_path, "wb") as f:
+                            f.write(data)
+                        log(f"  从 iframe/embed 下载 PDF: {target_path}")
+                        p.close()
+                        break
+                except Exception:
+                    pass
+                p.close()
+        else:
+            raise RuntimeError(f"下载失败 (未触发下载事件且无新 tab PDF): {e}")
+
+    # 关闭可能残留的 dialog
+    if dialog is not None:
+        try:
+            dismiss_modal(page)
         except Exception:
-            # expect_page 超时, 检查是否已有新 tab 打开
             pass
 
-    # 回退: 无 context 或 expect_page 失败, 用 context.pages 检查
-    if context is not None:
-        pages = context.pages
-        if len(pages) > 1:
-            # 返回最后一个非当前页的 page
-            for p in reversed(pages):
-                if p is not page:
-                    return p
-    return None
+    log(f"  保存 PDF: {target_path}")
+    return target_path
 
 
 def dismiss_modal(page):
@@ -772,28 +862,8 @@ def save_search_result_pdf(page, input_name: str, context=None) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     path = OUTPUT_DIR / f"{sanitize(input_name)} - search result.pdf"
     stabilize_for_pdf(page)
-    # 点击页面 Print 按钮, 触发打印预览并捕获用于生成 PDF 的 page (通常是新 tab)
-    target_page, used_print = click_print_button(page, context)
-    # 若 target_page 是当前页 (回退情况), 切换到 print media CSS;
-    # 若是新 tab, 其内容已是打印预览, 直接 page.pdf() 即可
-    is_new_tab = target_page is not page
-    if not is_new_tab:
-        try:
-            target_page.emulate_media(media="print")
-        except Exception:
-            pass
-    try:
-        target_page.pdf(path=str(path), print_background=True)
-    finally:
-        if not is_new_tab:
-            try:
-                target_page.emulate_media(media="screen")
-            except Exception:
-                pass
-    log(f"  保存搜索结果 PDF: {path}")
-    # 关闭 Print 弹出的 modal/popup, 避免拦截后续操作
-    if used_print and not is_new_tab:
-        dismiss_modal(page)
+    # 点击页面 Download 按钮, 选择 PDF, 下载保存
+    download_pdf(page, path, page_type="search")
     return path
 
 
@@ -854,28 +924,8 @@ def save_detail_pdf(page, input_name: str, result_name: str, profile_id: str, co
     # 用 input_name (模板输入名) 命名, 与 search result PDF 保持一致
     path = OUTPUT_DIR / f"{sanitize(input_name)} - {sanitize(profile_id)}.pdf"
     stabilize_for_pdf(page)
-    # 点击页面 Print 按钮, 触发打印预览并捕获用于生成 PDF 的 page (通常是新 tab)
-    target_page, used_print = click_print_button(page, context)
-    # 若 target_page 是当前页 (回退情况), 切换到 print media CSS;
-    # 若是新 tab, 其内容已是打印预览, 直接 page.pdf() 即可
-    is_new_tab = target_page is not page
-    if not is_new_tab:
-        try:
-            target_page.emulate_media(media="print")
-        except Exception:
-            pass
-    try:
-        target_page.pdf(path=str(path), print_background=True)
-    finally:
-        if not is_new_tab:
-            try:
-                target_page.emulate_media(media="screen")
-            except Exception:
-                pass
-    log(f"  保存详情 PDF: {path}")
-    # 关闭 Print 弹出的 modal/popup, 避免拦截后续操作
-    if used_print and not is_new_tab:
-        dismiss_modal(page)
+    # 点击页面 Download 按钮, 选择 PDF, 下载保存
+    download_pdf(page, path, page_type="detail")
     return path
 
 
