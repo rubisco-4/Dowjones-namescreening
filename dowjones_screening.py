@@ -680,22 +680,53 @@ def download_pdf(page, target_path: Path, page_type: str = "detail") -> Path:
                 return false;
             }""")
 
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(2000)
 
-    # 等待 dialog 出现
+    # 等待 dialog / modal 出现 (尝试多种容器选择器)
     dialog = None
-    try:
-        dialog = page.locator('[role="dialog"]').first
-        dialog.wait_for(state="visible", timeout=5000)
-    except Exception:
-        # 可能无 dialog (直接下载)
-        pass
+    for dlg_sel in [
+        '[role="dialog"]',
+        '[role="alertdialog"]',
+        '[class*="modal" i]',
+        '[class*="dialog" i]',
+        '[class*="overlay" i]',
+        'mat-dialog-container',
+        '.MuiDialog-container',
+    ]:
+        try:
+            loc = page.locator(dlg_sel).first
+            if loc.is_visible(timeout=2000):
+                dialog = loc
+                log(f"  找到对话框容器: {dlg_sel}")
+                break
+        except Exception:
+            continue
 
     container = dialog if dialog is not None else page
 
+    # 诊断: dump 对话框中所有可见按钮的文本
+    try:
+        btn_texts = container.evaluate("""(el) => {
+            const btns = el.querySelectorAll('button, [role="button"], a, [type="submit"]');
+            const texts = [];
+            for (const b of btns) {
+                const t = (b.innerText || b.textContent || '').trim();
+                const aria = b.getAttribute('aria-label') || '';
+                if (t || aria) {
+                    texts.push({text: t.substring(0, 50), aria: aria.substring(0, 30), tag: b.tagName});
+                }
+            }
+            return texts;
+        }""") if dialog is not None else []
+        if btn_texts:
+            log(f"  对话框中的按钮: {btn_texts}")
+    except Exception:
+        pass
+
     # 选择 PDF 格式 (搜索结果页与详情页均尝试; 若无 PDF 选项则跳过, 使用默认)
     for sel in ['text="PDF"', 'button:has-text("PDF")', '[role="radio"]:has-text("PDF")',
-                'label:has-text("PDF")', '[role="option"]:has-text("PDF")']:
+                'label:has-text("PDF")', '[role="option"]:has-text("PDF")',
+                'span:has-text("PDF")']:
         try:
             loc = container.locator(sel).first
             if loc.is_visible(timeout=1000):
@@ -709,47 +740,94 @@ def download_pdf(page, target_path: Path, page_type: str = "detail") -> Path:
         except Exception:
             continue
 
-    # 点击 Continue/CONTINUE 按钮触发下载
+    # 点击 Continue/CONTINUE/Download 按钮触发下载
+    # 先用 CSS 选择器尝试
     continue_btn = None
     for sel in [
         'button:has-text("Continue")',
         'button:has-text("CONTINUE")',
         'button:has-text("Download")',
+        'button:has-text("DOWNLOAD")',
         'button:has-text("OK")',
+        'button:has-text("Confirm")',
+        'button:has-text("Submit")',
+        'button:has-text("Export")',
+        'button:has-text("GENERATE")',
+        'button:has-text("Generate")',
+        'a:has-text("Continue")',
+        'a:has-text("CONTINUE")',
+        'a:has-text("Download")',
+        '[role="button"]:has-text("Continue")',
+        '[role="button"]:has-text("CONTINUE")',
+        '[role="button"]:has-text("Download")',
+        'button[type="submit"]',
     ]:
         try:
             loc = container.locator(sel).first
             if loc.is_visible(timeout=1000):
                 continue_btn = loc
+                log(f"  找到动作按钮: {sel}")
                 break
         except Exception:
             continue
 
+    # CSS 选择器未找到 → 用 JS 遍历所有按钮, 模糊匹配动作关键词
     if continue_btn is None:
-        raise RuntimeError("对话框中未找到 Continue 按钮")
+        log("  CSS 选择器未找到动作按钮, 尝试 JS 遍历")
+        found = page.evaluate("""(containerEl) => {
+            const root = containerEl || document;
+            const btns = root.querySelectorAll('button, [role="button"], a, [type="submit"]');
+            const actionWords = ['continue', 'download', 'ok', 'confirm', 'submit', 'export', 'generate', '导出', '下载', '继续'];
+            for (const b of btns) {
+                const t = (b.innerText || b.textContent || '').trim().toLowerCase();
+                const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+                if (actionWords.some(w => t === w || t.startsWith(w) || t.includes(w)) ||
+                    actionWords.some(w => aria === w || aria.includes(w))) {
+                    b.click();
+                    return t || aria;
+                }
+            }
+            return '';
+        }""", container.element_handle() if dialog is not None else None)
+        if found:
+            log(f"  JS 点击了按钮: {found}")
+            # JS 已点击, 跳过 Playwright click, 直接进入 expect_download
+            continue_btn = "js_clicked"
+        else:
+            # 最后回退: dump 整个对话框的文本内容用于排查
+            try:
+                dlg_text = container.inner_text(timeout=2000) if dialog is not None else ""
+                log(f"  对话框文本内容: {dlg_text[:500]}")
+            except Exception:
+                pass
+            raise RuntimeError("对话框中未找到 Continue/Download 按钮")
 
-    log("  点击 Continue 触发下载")
+    log("  点击动作按钮触发下载")
     # 用 expect_download 捕获下载事件
     try:
         with page.expect_download(timeout=60000) as dl_info:
-            try:
-                continue_btn.click(timeout=5000)
-            except Exception:
+            if continue_btn == "js_clicked":
+                # JS 已点击, 只需等待下载
+                pass
+            else:
                 try:
-                    continue_btn.click(force=True, timeout=5000)
+                    continue_btn.click(timeout=5000)
                 except Exception:
-                    page.evaluate("""() => {
-                        const dialog = document.querySelector('[role="dialog"]') || document;
-                        const btns = dialog.querySelectorAll('button, [role="button"]');
-                        for (const b of btns) {
-                            const t = (b.innerText || b.textContent || '').trim().toLowerCase();
-                            if (t === 'continue' || t === 'download' || t === 'ok') {
-                                b.click();
-                                return true;
+                    try:
+                        continue_btn.click(force=True, timeout=5000)
+                    except Exception:
+                        page.evaluate("""() => {
+                            const dialog = document.querySelector('[role="dialog"]') || document;
+                            const btns = dialog.querySelectorAll('button, [role="button"]');
+                            for (const b of btns) {
+                                const t = (b.innerText || b.textContent || '').trim().toLowerCase();
+                                if (t === 'continue' || t === 'download' || t === 'ok') {
+                                    b.click();
+                                    return true;
+                                }
                             }
-                        }
-                        return false;
-                    }""")
+                            return false;
+                        }""")
         download = dl_info.value
         log(f"  下载成功: {download.suggested_filename}")
         download.save_as(str(target_path))
