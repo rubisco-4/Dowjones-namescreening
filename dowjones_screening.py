@@ -73,7 +73,7 @@ def read_template(path: Path):
     rows = []
     # 先过滤注释行与空行, 再交给 DictReader 解析表头
     cleaned = []
-    with open(path, newline="", encoding="utf-8") as f:
+    with open(path, newline="", encoding="utf-8-sig") as f:
         for line in f:
             s = line.strip()
             if not s or s.startswith("#"):

@@ -1,4 +1,4 @@
-# Dow Jones Name Screening 输入模板
+﻿# Dow Jones Name Screening 输入模板
 # 字段说明:
 #   type   - 必填, 取值 person 或 entity
 #   name   - 必填, 待筛查的完整名称
