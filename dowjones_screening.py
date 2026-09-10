@@ -256,12 +256,11 @@ def login(page, base_url: str):
                     except Exception:
                         pass
                     page.wait_for_timeout(3000)
-                    # reload 仍未跳走 → 直接导航到搜索页 (SSO 可能已写入 session cookie,
-                    # 服务端鉴权可用, 仅 SPA 客户端的 code 交换 XHR 因网络/代理失败)
+                    # reload 仍未跳走 → 直接导航到 dashboard (SSO 可能已写入 session cookie)
                     if "oauthcallback" in (page.url or "").lower():
-                        log("  reload 无效, 直接导航到搜索页 (依赖已设置的 session cookie)")
+                        log("  reload 无效, 直接导航到 dashboard (依赖已设置的 session cookie)")
                         try:
-                            page.goto(DJ_ADVANCED_SEARCH_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
+                            page.goto(DJ_BASE_URL + "/dashboard", wait_until="domcontentloaded", timeout=TIMEOUT_MS)
                         except Exception:
                             pass
                         page.wait_for_timeout(3000)
@@ -460,10 +459,11 @@ def _collect_result_links(page):
 
     精确匹配 href 含 profile id 的链接, 过滤导航/分页/页眉页脚等噪音。
     """
-    # 真实结果链接: href 含 /profile/{id} 或 /riskentities/profiles/{id}
+    # 真实结果链接: href 含 profile 详情页路径/参数
     profile_href_selectors = [
         'a[href*="/profile/"]',
         'a[href*="/riskentities/profiles/"]',
+        'a[href*="profile?id="]',
         'a[href*="profileId="]',
         'a[href*="profile_id="]',
         'a[data-testid*="result" i]',
@@ -520,7 +520,8 @@ def _looks_like_profile_href(href: str) -> bool:
         last = href.rstrip("/").rsplit("/", 1)[-1].split("?")[0]
         if len(last) >= 3 and re.match(r"^[A-Za-z0-9_\-]+$", last):
             return True
-    if "profileid=" in h or "profile_id=" in h:
+    # /search/profile?id=12345678 或 profileId= / profile_id= 形式
+    if re.search(r"profile\?id=\d{3,}", h) or "profileid=" in h or "profile_id=" in h:
         return True
     return False
 
@@ -545,9 +546,8 @@ def stabilize_for_pdf(page):
 
 
 def save_search_result_pdf(page, input_name: str) -> Path:
-    out_dir = OUTPUT_DIR / sanitize(input_name)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"{sanitize(input_name)} - search result.pdf"
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    path = OUTPUT_DIR / f"{sanitize(input_name)} - search result.pdf"
     stabilize_for_pdf(page)
     page.pdf(path=str(path))
     log(f"  保存搜索结果 PDF: {path}")
@@ -557,11 +557,16 @@ def save_search_result_pdf(page, input_name: str) -> Path:
 def extract_profile_id(page) -> str:
     """从详情页 URL 或页面字段提取 profile id。"""
     url = page.url
+    # /search/profile?id=12345678 (simple search 详情页)
+    m = re.search(r"/search/profile\?id=([^&#]+)", url, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    # /riskentities/profiles/{id}
     m = re.search(r"/riskentities/profiles/([^/?#]+)", url, re.IGNORECASE)
     if m:
         return m.group(1)
-    # 回退: URL 中任意 profile id 段
-    m = re.search(r"profile[_-]?id[=/]([A-Za-z0-9-]+)", url, re.IGNORECASE)
+    # 回退: URL 中任意 profile id 段 (profileId= / profile_id= / profile?id=)
+    m = re.search(r"profile[_-]?id[=/?]([A-Za-z0-9-]+)", url, re.IGNORECASE)
     if m:
         return m.group(1)
     # 回退: 页面字段
@@ -602,9 +607,8 @@ def extract_result_name(page, clicked_text: str) -> str:
 
 
 def save_detail_pdf(page, input_name: str, result_name: str, profile_id: str) -> Path:
-    out_dir = OUTPUT_DIR / sanitize(input_name)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"{sanitize(result_name)} - {sanitize(profile_id)}.pdf"
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    path = OUTPUT_DIR / f"{sanitize(result_name)} - {sanitize(profile_id)}.pdf"
     stabilize_for_pdf(page)
     page.pdf(path=str(path))
     log(f"  保存详情 PDF: {path}")
@@ -674,7 +678,7 @@ def process_one(page, row, search_url: str):
 
             # 校验确实进入了详情页 (URL 含 profile id); 否则跳过此项
             profile_id = extract_profile_id(page)
-            if not _looks_like_profile_href(page.url) and profile_id in ("unknown", "", "profile"):
+            if not _looks_like_profile_href(page.url) and profile_id in ("unknown", "", "profile", "simple", "search"):
                 log(f"  结果 {idx+1} 未进入详情页 (URL={page.url[:80]}), 跳过")
                 # 回到结果页继续下一项
                 try:

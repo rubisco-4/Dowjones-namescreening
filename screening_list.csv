@@ -5,5 +5,6 @@
 #   remark - 选填, 备注
 # 以 # 开头的行与空行会被忽略
 type,name,remark
-entity,BOC Group,示例-实体
-person,John Smith,示例-个人
+entity,上海国泰海通证券资产有限公司,示例-实体
+person,王新宇,示例-个人
+person,钱军,示例-个人
