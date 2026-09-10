@@ -1,0 +1,21 @@
+# Checklist
+
+- [ ] 输入模板文件已创建，包含 `type` / `name` / `remark` 字段，并有至少 1 个 entity 与 1 个 person 示例行
+- [ ] 模板读取逻辑可正确解析每一行
+- [ ] 浏览器自动化环境搭建完成
+- [ ] 使用凭据 ISMO-Support@bocigroup.com / 12345678 可自动登录 riskcenter.dowjones.com
+- [ ] 登录失败时流程停止并报错
+- [ ] 可导航到 `riskcenter.dowjones.com/search/advanced`
+- [ ] 根据 type 字段正确选择 searching type = person / entity
+- [ ] name 字段填入后能成功触发搜索并等待结果页加载
+- [ ] 搜索结果页打印为 PDF 且文件名为 `{name} - search result.pdf`
+- [ ] PDF 保存到统一输出目录
+- [ ] 无结果时跳过详情页步骤并记录日志
+- [ ] 有结果时点击每个结果的 name 进入详情页
+- [ ] 详情页能定位并提取 profile id
+- [ ] 详情页打印为 PDF 且文件名为 `{name} - profile id.pdf`
+- [ ] 同一 name 多结果时文件名追加序号避免覆盖
+- [ ] 批量循环可处理模板所有行
+- [ ] 单行失败不阻断整体流程，错误被记录
+- [ ] 处理完成后输出汇总（成功 / 无结果 / 失败）
+- [ ] 端到端示例数据跑通，所有 PDF 命名与位置正确
