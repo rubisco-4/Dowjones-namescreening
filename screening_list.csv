@@ -1,0 +1,9 @@
+# Dow Jones Name Screening 输入模板
+# 字段说明:
+#   type   - 必填, 取值 person 或 entity
+#   name   - 必填, 待筛查的完整名称
+#   remark - 选填, 备注
+# 以 # 开头的行与空行会被忽略
+type,name,remark
+entity,BOC Group,示例-实体
+person,John Smith,示例-个人

@@ -29,17 +29,20 @@
 ```
 output/
 ├── run_summary.csv                          # 每行名单的处理结果
-├── BOC Group/
-│   ├── BOC Group - search result.pdf
-│   ├── BOC Group - 1234567.pdf               # profile id = 1234567
-│   └── BOC Group - 7654321.pdf               # 同名多结果追加序号区分
+├── BOC Group/                               # 子目录名 = 模板输入名 (input_name)
+│   ├── BOC Group - search result.pdf        # 用 input_name 命名
+│   ├── Bank of China Group - 1234567.pdf    # 用 搜索出的结果名 + 该结果 profile id 命名
+│   └── BOC Group Ltd - 7654321.pdf          # 多结果时，每个结果用各自 result_name + profile_id
 └── John Smith/
     ├── John Smith - search result.pdf
-    └── John Smith - 9876543.pdf
+    └── John A Smith - 9876543.pdf
 ```
-- 每个名单一个子目录，子目录名 = name
-- 搜索结果 PDF 命名：`{name} - search result.pdf`
-- 详情页 PDF 命名：`{name} - {profile_id}.pdf`（同名多结果时以 profile id 自然区分，无需额外序号）
+- 每个名单一个子目录，子目录名 = 模板输入名 (input_name)
+- 搜索结果页 PDF 命名：`{input_name} - search result.pdf`（用模板输入名）
+- 详情页 PDF 命名：`{result_name} - {profile_id}.pdf`
+  - `{result_name}` 与 `{profile_id}` 都来自**点击进入的那个具体搜索结果**
+  - 即：搜索结果列表中某条结果的 name（点击它进入详情页）+ 该结果详情页上的 profile id
+  - 多结果时，每个结果用各自的 result_name + profile_id 自然区分，无需额外序号
 - 文件名含非法字符（`/ \ : * ? " < > |`）时替换为 `_`
 
 ## Impact
@@ -133,20 +136,30 @@ output/
 - **AND** 在 `run_summary.csv` 标记该 name 状态为 `no_result`
 - **AND** 继续处理下一行
 
-### Requirement: 详情页 Profile ID 提取与 PDF 留痕
-系统 SHALL 从详情页提取 profile id 并将详情页打印为 PDF。
+### Requirement: 详情页 Profile ID 与结果名提取
+系统 SHALL 从每个搜索结果的详情页提取该结果自身的 result_name 与 profile_id。
+
+#### Scenario: 提取 result_name
+- **WHEN** 用户在搜索结果页点击某个结果的 name 进入详情页
+- **THEN** 系统记录被点击的结果 name 作为 `result_name`
+- **AND** 若详情页顶部有更完整的正式名称，则以详情页正式名称覆盖 `result_name`
 
 #### Scenario: 提取 profile id
 - **WHEN** 详情页加载完成
 - **THEN** 系统从详情页 URL (`/riskentities/profiles/{profile_id}`) 提取 profile id
 - **AND** 若 URL 不含 id，则回退到详情页页面字段中定位 profile id 标签
+- **AND** 该 profile id 必须属于当前点击的那个搜索结果，而非其它结果
+
+### Requirement: 详情页 PDF 留痕
+系统 SHALL 将每个搜索结果的详情页打印为 PDF。
 
 #### Scenario: 保存详情页 PDF
-- **WHEN** profile id 提取成功
+- **WHEN** result_name 与 profile id 提取成功
 - **THEN** 系统使用 `page.pdf()` 打印整页
-- **AND** 文件命名为 `{name} - {profile_id}.pdf`
-- **AND** 保存到 `output/{name}/` 子目录
-- **AND** 同一 name 有多个结果时，不同 profile id 自然产生不同文件名，无需额外序号
+- **AND** 文件命名为 `{result_name} - {profile_id}.pdf`
+  - `{result_name}` 与 `{profile_id}` 均来自当前点击的那个搜索结果
+- **AND** 保存到 `output/{input_name}/` 子目录（子目录用模板输入名）
+- **AND** 同一 input_name 有多个搜索结果时，每个结果用各自的 result_name + profile_id 自然产生不同文件名，无需额外序号
 
 ### Requirement: 批量编排与汇总
 系统 SHALL 依次处理模板中每一行，并生成所有 PDF 到统一输出目录。
