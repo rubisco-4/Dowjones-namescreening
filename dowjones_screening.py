@@ -61,6 +61,30 @@ def sanitize(name: str) -> str:
     return ILLEGAL_FN_CHARS.sub("_", name).strip()
 
 
+def _get_proxy_url() -> str:
+    """读取当前代理配置 (沙箱环境通过本地代理出网)。"""
+    return (
+        os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("http_proxy")
+        or ""
+    )
+
+
+def _build_proxy_opener():
+    """构建 urllib opener (走代理, 沙箱环境必须通过代理出网)。"""
+    import urllib.request
+    proxy_url = _get_proxy_url()
+    if proxy_url:
+        proxy_handler = urllib.request.ProxyHandler({
+            "http": proxy_url,
+            "https": proxy_url,
+        })
+        return urllib.request.build_opener(proxy_handler)
+    return urllib.request.build_opener()
+
+
 def log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
@@ -112,7 +136,7 @@ def login(page, base_url: str):
     page.goto(base_url, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
 
     # 设置 token exchange 请求重试路由: 网络抖动时 code 交换 XHR 易失败,
-    # 代理对 accounts.dowjones.com 的 POST 偶发超时, 改用 urllib 直连 (不走代理)
+    # 用 urllib 走代理重试 (沙箱环境必须通过代理出网)
     try:
         import urllib.request
         import urllib.error
@@ -132,8 +156,7 @@ def login(page, base_url: str):
                         headers=headers,
                         method=request.method,
                     )
-                    # 直连不走代理 (创建无 proxy 的 opener)
-                    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                    opener = _build_proxy_opener()
                     with opener.open(req, timeout=30) as resp:
                         body = resp.read()
                         route.fulfill(
@@ -613,251 +636,374 @@ def stabilize_for_pdf(page):
 def download_pdf(page, target_path: Path, page_type: str = "detail") -> Path:
     """点击页面 Download 按钮, 选择 PDF 格式, 下载并保存到 target_path。
 
-    Dow Jones Risk Center 的 Download 流程 (搜索结果页与详情页统一):
-      1. 点击页面上方 Download 按钮
-      2. 弹出对话框, 若有 PDF 格式选项则选择 "PDF"
-      3. 点击 "Continue" / "CONTINUE" 按钮
-      4. PDF 文件下载并保存到 target_path
-
-    参数:
-        page: 当前页面
-        target_path: 保存目标路径
-        page_type: "search" 或 "detail"
-    返回: 保存的文件路径
+    用 expect_download 包裹整个交互流程: 点击 Download → 等 dialog/dropdown → 选 PDF → 点 Continue。
+    若 Download 按钮直接触发下载 (无 dialog), expect_download 也能捕获。
     """
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 查找 Download 按钮:
-    # - 详情页: button[aria-label="Download"] (图标按钮)
-    # - 搜索结果页: button:has-text("Download") 或含 file-download svg 的按钮
-    download_selectors = [
-        'button[aria-label="Download"]',
-        'button[aria-label*="download" i]',
-        'a[aria-label*="download" i]',
-        'button:has(svg[aria-label="file-download"])',
-        'button:has-text("Download")',
-        'a:has-text("Download")',
-    ]
-    dl_btn = None
-    for sel in download_selectors:
-        try:
-            loc = page.locator(sel).first
-            if loc.is_visible(timeout=1000):
-                dl_btn = loc
-                break
-        except Exception:
-            continue
+    # 记录点击 Download 前页面上可见的 "PDF" 元素数量 (用于检测新增的 PDF 选项)
+    try:
+        pdf_count_before = page.locator('text="PDF"').count()
+    except Exception:
+        pdf_count_before = 0
 
+    # 查找页面上方的 Download 按钮
+    # Dow Jones Risk Center 的 Download 按钮是图标按钮 (svg[aria-label="file-download"])
+    # 其父元素是可点击的 button/div, 但 SVG 不在 button:has-text("Download") 内部
+    dl_btn = None
+    dl_btn_sel = ""
+    # 优先: 通过 SVG 图标找 Download 按钮 (这是页面上真正的 Download 图标按钮)
+    try:
+        svg_loc = page.locator('svg[aria-label="file-download"]').first
+        if svg_loc.is_visible(timeout=2000):
+            # SVG 的父元素是可点击的按钮/div
+            dl_btn = svg_loc
+            dl_btn_sel = 'svg[aria-label="file-download"]'
+            log("  找到 Download 图标按钮 (svg file-download)")
+    except Exception:
+        pass
+
+    # 回退: 文字按钮 / aria-label 按钮
     if dl_btn is None:
-        # 回退: 直接找 svg[aria-label="file-download"]
-        try:
-            svg_loc = page.locator('svg[aria-label="file-download"]').first
-            if svg_loc.is_visible(timeout=1000):
-                dl_btn = svg_loc
-        except Exception:
-            pass
+        for sel in [
+            'button[aria-label="Download"]',
+            'button[aria-label*="download" i]',
+            'a[aria-label*="download" i]',
+            'button:has(svg[aria-label="file-download"])',
+            'button:has-text("Download")',
+            'a:has-text("Download")',
+        ]:
+            try:
+                loc = page.locator(sel).first
+                if loc.is_visible(timeout=1000):
+                    dl_btn = loc
+                    dl_btn_sel = sel
+                    break
+            except Exception:
+                continue
 
     if dl_btn is None:
         raise RuntimeError("未找到 Download 按钮")
 
-    log(f"  找到 Download 按钮, 点击")
+    # 用 expect_download 包裹整个流程 (Download 点击 + dialog 交互 + Continue 点击)
     try:
-        dl_btn.click(timeout=5000)
-    except Exception:
-        try:
-            dl_btn.click(force=True, timeout=5000)
-        except Exception:
-            page.evaluate("""() => {
-                const btns = document.querySelectorAll('button, a, [role="button"]');
-                for (const b of btns) {
-                    const aria = b.getAttribute('aria-label') || '';
-                    const t = (b.innerText || b.textContent || '').trim();
-                    if (aria.toLowerCase() === 'download' || t.toLowerCase() === 'download') {
-                        b.click();
-                        return true;
-                    }
-                }
-                return false;
-            }""")
-
-    page.wait_for_timeout(2000)
-
-    # 等待 dialog / modal 出现 (尝试多种容器选择器)
-    dialog = None
-    for dlg_sel in [
-        '[role="dialog"]',
-        '[role="alertdialog"]',
-        '[class*="modal" i]',
-        '[class*="dialog" i]',
-        '[class*="overlay" i]',
-        'mat-dialog-container',
-        '.MuiDialog-container',
-    ]:
-        try:
-            loc = page.locator(dlg_sel).first
-            if loc.is_visible(timeout=2000):
-                dialog = loc
-                log(f"  找到对话框容器: {dlg_sel}")
-                break
-        except Exception:
-            continue
-
-    container = dialog if dialog is not None else page
-
-    # 诊断: dump 对话框中所有可见按钮的文本
-    try:
-        btn_texts = container.evaluate("""(el) => {
-            const btns = el.querySelectorAll('button, [role="button"], a, [type="submit"]');
-            const texts = [];
-            for (const b of btns) {
-                const t = (b.innerText || b.textContent || '').trim();
-                const aria = b.getAttribute('aria-label') || '';
-                if (t || aria) {
-                    texts.push({text: t.substring(0, 50), aria: aria.substring(0, 30), tag: b.tagName});
-                }
-            }
-            return texts;
-        }""") if dialog is not None else []
-        if btn_texts:
-            log(f"  对话框中的按钮: {btn_texts}")
-    except Exception:
-        pass
-
-    # 选择 PDF 格式 (搜索结果页与详情页均尝试; 若无 PDF 选项则跳过, 使用默认)
-    for sel in ['text="PDF"', 'button:has-text("PDF")', '[role="radio"]:has-text("PDF")',
-                'label:has-text("PDF")', '[role="option"]:has-text("PDF")',
-                'span:has-text("PDF")']:
-        try:
-            loc = container.locator(sel).first
-            if loc.is_visible(timeout=1000):
-                log("  选择 PDF 格式")
+        with page.expect_download(timeout=120000) as dl_info:
+            # 点击 Download 按钮
+            # SVG 图标按钮常被 overlay 拦截 pointer events
+            if dl_btn_sel == 'svg[aria-label="file-download"]':
+                # 方案 1: Playwright force=True 直接点击 SVG (跳过 actionability 检查)
                 try:
-                    loc.click(timeout=3000)
-                except Exception:
-                    loc.click(force=True, timeout=3000)
-                page.wait_for_timeout(500)
-                break
-        except Exception:
-            continue
-
-    # 点击 Continue/CONTINUE/Download 按钮触发下载
-    # 先用 CSS 选择器尝试
-    continue_btn = None
-    for sel in [
-        'button:has-text("Continue")',
-        'button:has-text("CONTINUE")',
-        'button:has-text("Download")',
-        'button:has-text("DOWNLOAD")',
-        'button:has-text("OK")',
-        'button:has-text("Confirm")',
-        'button:has-text("Submit")',
-        'button:has-text("Export")',
-        'button:has-text("GENERATE")',
-        'button:has-text("Generate")',
-        'a:has-text("Continue")',
-        'a:has-text("CONTINUE")',
-        'a:has-text("Download")',
-        '[role="button"]:has-text("Continue")',
-        '[role="button"]:has-text("CONTINUE")',
-        '[role="button"]:has-text("Download")',
-        'button[type="submit"]',
-    ]:
-        try:
-            loc = container.locator(sel).first
-            if loc.is_visible(timeout=1000):
-                continue_btn = loc
-                log(f"  找到动作按钮: {sel}")
-                break
-        except Exception:
-            continue
-
-    # CSS 选择器未找到 → 用 JS 遍历所有按钮, 模糊匹配动作关键词
-    if continue_btn is None:
-        log("  CSS 选择器未找到动作按钮, 尝试 JS 遍历")
-        found = page.evaluate("""(containerEl) => {
-            const root = containerEl || document;
-            const btns = root.querySelectorAll('button, [role="button"], a, [type="submit"]');
-            const actionWords = ['continue', 'download', 'ok', 'confirm', 'submit', 'export', 'generate', '导出', '下载', '继续'];
-            for (const b of btns) {
-                const t = (b.innerText || b.textContent || '').trim().toLowerCase();
-                const aria = (b.getAttribute('aria-label') || '').toLowerCase();
-                if (actionWords.some(w => t === w || t.startsWith(w) || t.includes(w)) ||
-                    actionWords.some(w => aria === w || aria.includes(w))) {
-                    b.click();
-                    return t || aria;
-                }
-            }
-            return '';
-        }""", container.element_handle() if dialog is not None else None)
-        if found:
-            log(f"  JS 点击了按钮: {found}")
-            # JS 已点击, 跳过 Playwright click, 直接进入 expect_download
-            continue_btn = "js_clicked"
-        else:
-            # 最后回退: dump 整个对话框的文本内容用于排查
-            try:
-                dlg_text = container.inner_text(timeout=2000) if dialog is not None else ""
-                log(f"  对话框文本内容: {dlg_text[:500]}")
-            except Exception:
-                pass
-            raise RuntimeError("对话框中未找到 Continue/Download 按钮")
-
-    log("  点击动作按钮触发下载")
-    # 用 expect_download 捕获下载事件
-    try:
-        with page.expect_download(timeout=60000) as dl_info:
-            if continue_btn == "js_clicked":
-                # JS 已点击, 只需等待下载
-                pass
-            else:
-                try:
-                    continue_btn.click(timeout=5000)
-                except Exception:
+                    dl_btn.click(force=True, timeout=5000)
+                    log("  Download SVG 点击成功 (force=True)")
+                except Exception as e1:
+                    log(f"  SVG force click 失败, 尝试坐标点击: {str(e1)[:80]}")
+                    # 方案 2: 获取 SVG 坐标, 用 mouse.click 直接点击
                     try:
-                        continue_btn.click(force=True, timeout=5000)
-                    except Exception:
-                        page.evaluate("""() => {
-                            const dialog = document.querySelector('[role="dialog"]') || document;
-                            const btns = dialog.querySelectorAll('button, [role="button"]');
-                            for (const b of btns) {
-                                const t = (b.innerText || b.textContent || '').trim().toLowerCase();
-                                if (t === 'continue' || t === 'download' || t === 'ok') {
-                                    b.click();
-                                    return true;
+                        box = dl_btn.bounding_box()
+                        if box:
+                            cx = box["x"] + box["width"] / 2
+                            cy = box["y"] + box["height"] / 2
+                            log(f"  SVG 坐标: ({cx:.0f}, {cy:.0f}), 用 mouse.click")
+                            page.mouse.click(cx, cy)
+                            log("  mouse.click 完成")
+                    except Exception as e2:
+                        log(f"  坐标点击失败, 尝试 JS: {str(e2)[:80]}")
+                        # 方案 3: JS dispatchEvent
+                        js_result = page.evaluate("""() => {
+                            const svg = document.querySelector('svg[aria-label="file-download"]');
+                            if (!svg) return 'svg not found';
+                            let el = svg;
+                            for (let i = 0; i < 5; i++) {
+                                el = el.parentElement;
+                                if (!el) break;
+                                const tag = el.tagName.toLowerCase();
+                                const role = el.getAttribute('role') || '';
+                                if (tag === 'button' || tag === 'a' || role === 'button') {
+                                    el.click();
+                                    return 'clicked: ' + tag;
                                 }
                             }
-                            return false;
+                            const parent = svg.parentElement;
+                            if (parent) {
+                                parent.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+                                return 'dispatchEvent on ' + parent.tagName;
+                            }
+                            return 'failed';
                         }""")
+                        log(f"  JS 点击 Download: {js_result}")
+            else:
+                # 普通按钮: 先 scroll, 再 click, 再 force, 再 JS
+                try:
+                    dl_btn.scroll_into_view_if_needed(timeout=3000)
+                except Exception:
+                    pass
+                clicked = False
+                try:
+                    dl_btn.click(timeout=5000)
+                    clicked = True
+                    log("  Download 按钮点击成功 (普通 click)")
+                except Exception as e1:
+                    log(f"  普通 click 失败, 尝试 force=True: {str(e1)[:80]}")
+                    try:
+                        dl_btn.click(force=True, timeout=5000)
+                        clicked = True
+                        log("  Download 按钮点击成功 (force=True)")
+                    except Exception:
+                        pass
+                if not clicked:
+                    page.evaluate("""() => {
+                        const btns = document.querySelectorAll('button, a, [role="button"]');
+                        for (const b of btns) {
+                            const aria = b.getAttribute('aria-label') || '';
+                            const t = (b.innerText || b.textContent || '').trim();
+                            if (aria.toLowerCase() === 'download' || t.toLowerCase() === 'download') {
+                                b.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }""")
+
+            # 等待 dialog / dropdown / popover 出现 (轮询, 最多 10 秒)
+            dialog = None
+            for wait_round in range(20):
+                page.wait_for_timeout(500)
+                for dlg_sel in [
+                    '[role="dialog"]',
+                    '[role="alertdialog"]',
+                    '[role="menu"]',
+                    '[class*="modal" i]',
+                    '[class*="dialog" i]',
+                    '[class*="overlay" i]',
+                    '[class*="popover" i]',
+                    '[class*="dropdown" i]',
+                    '[class*="popup" i]',
+                    'mat-dialog-container',
+                    '.MuiDialog-container',
+                    '.MuiPopover-paper',
+                    '[class*="ant-modal" i]',
+                    '[class*="ant-dropdown" i]',
+                    '[class*="ant-popover" i]',
+                ]:
+                    try:
+                        loc = page.locator(dlg_sel).first
+                        if loc.is_visible(timeout=200):
+                            dialog = loc
+                            log(f"  找到对话框容器: {dlg_sel} (第 {wait_round+1} 轮)")
+                            break
+                    except Exception:
+                        continue
+                if dialog is not None:
+                    break
+                # 也检测是否有新增的 "PDF" 或 "Continue" 文本
+                try:
+                    pdf_now = page.locator('text="PDF"').count()
+                    cont_now = page.locator('text="Continue"').count() + page.locator('text="CONTINUE"').count()
+                    if pdf_now > pdf_count_before or cont_now > 0:
+                        log(f"  第 {wait_round+1} 轮: 检测到 PDF({pdf_now}) 或 Continue({cont_now}) 文本")
+                        break
+                except Exception:
+                    pass
+
+            container = dialog if dialog is not None else page
+
+            # 诊断: 若未找到 dialog, dump 页面 body 的前 1500 字符并截图
+            if dialog is None:
+                try:
+                    body_html = page.evaluate("""() => {
+                        return document.body.innerHTML.substring(0, 1500);
+                    }""")
+                    log(f"  未找到 dialog, 页面 body 前 1500 字符: {body_html[:800]}")
+                except Exception:
+                    pass
+                # 截图用于排查
+                try:
+                    screenshot_path = OUTPUT_DIR / "debug_download.png"
+                    page.screenshot(path=str(screenshot_path), full_page=True)
+                    log(f"  截图已保存: {screenshot_path}")
+                except Exception:
+                    pass
+                # dump 所有可见按钮的完整信息 (含父元素 class)
+                try:
+                    all_btns = page.evaluate("""() => {
+                        const btns = document.querySelectorAll('button, [role="button"], a');
+                        const results = [];
+                        for (const b of btns) {
+                            const rect = b.getBoundingClientRect();
+                            if (rect.width === 0 || rect.height === 0) continue;
+                            if (b.offsetParent === null) continue;
+                            const t = (b.innerText || b.textContent || '').trim();
+                            const aria = b.getAttribute('aria-label') || '';
+                            const cls = (b.className || '').toString().substring(0, 60);
+                            const parent = b.parentElement;
+                            const pcls = parent ? (parent.className || '').toString().substring(0, 60) : '';
+                            const disabled = b.disabled || false;
+                            results.push({text: t.substring(0, 30), aria: aria.substring(0, 20), cls: cls, pcls: pcls, disabled: disabled});
+                        }
+                        return results;
+                    }""")
+                    log(f"  所有可见按钮 (含 class/disabled): {all_btns}")
+                except Exception:
+                    pass
+
+            # 检测是否有新增的 "PDF" 选项 (点击 Download 后新出现的)
+            try:
+                pdf_count_after = page.locator('text="PDF"').count()
+            except Exception:
+                pdf_count_after = 0
+
+            if pdf_count_after > pdf_count_before:
+                log(f"  检测到新增 PDF 选项 (before={pdf_count_before}, after={pdf_count_after})")
+
+            # 选择 PDF 格式 (在整个页面范围内搜索, 不局限于 dialog)
+            pdf_clicked = False
+            for sel in ['text="PDF"', 'button:has-text("PDF")', '[role="radio"]:has-text("PDF")',
+                        'label:has-text("PDF")', '[role="option"]:has-text("PDF")',
+                        'span:has-text("PDF")', 'li:has-text("PDF")']:
+                try:
+                    loc = page.locator(sel).first
+                    if loc.is_visible(timeout=1000):
+                        log("  选择 PDF 格式")
+                        try:
+                            loc.click(timeout=3000)
+                        except Exception:
+                            loc.click(force=True, timeout=3000)
+                        page.wait_for_timeout(1000)
+                        pdf_clicked = True
+                        break
+                except Exception:
+                    continue
+
+            if not pdf_clicked:
+                log("  未找到 PDF 选项 (可能使用默认格式)")
+
+            # 点击动作按钮 (Continue/CONTINUE/Download 等) 触发下载
+            # 排除原始 Download 按钮 (如果它仍然可见)
+            action_btn = None
+            for sel in [
+                'button:has-text("Continue")',
+                'button:has-text("CONTINUE")',
+                'button:has-text("OK")',
+                'button:has-text("Confirm")',
+                'button:has-text("Submit")',
+                'button:has-text("Export")',
+                'button:has-text("GENERATE")',
+                'button:has-text("Generate")',
+                'a:has-text("Continue")',
+                'a:has-text("CONTINUE")',
+                '[role="button"]:has-text("Continue")',
+                '[role="button"]:has-text("CONTINUE")',
+                'button[type="submit"]',
+            ]:
+                try:
+                    loc = page.locator(sel).first
+                    if loc.is_visible(timeout=1000):
+                        action_btn = loc
+                        log(f"  找到动作按钮: {sel}")
+                        break
+                except Exception:
+                    continue
+
+            if action_btn is None:
+                # JS 遍历所有按钮找动作关键词 (排除原始 Download 按钮)
+                log("  CSS 选择器未找到动作按钮, 尝试 JS 遍历")
+                found = page.evaluate("""() => {
+                    const btns = document.querySelectorAll('button, [role="button"], a, [type="submit"]');
+                    // 优先级: continue > ok > confirm > submit > export > generate > download
+                    const priorities = [
+                        ['continue', '继续'],
+                        ['ok', 'confirm', '确定'],
+                        ['submit', 'export', 'generate', '导出', '生成'],
+                        ['download', '下载'],
+                    ];
+                    for (const group of priorities) {
+                        for (const b of btns) {
+                            const t = (b.innerText || b.textContent || '').trim().toLowerCase();
+                            const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+                            // 排除工具栏的原始 Download 按钮 (它旁边有 Print/Email)
+                            if (group.includes('download')) {
+                                const parent = b.parentElement;
+                                if (parent) {
+                                    const siblings = Array.from(parent.children);
+                                    const hasPrint = siblings.some(s =>
+                                        (s.innerText || '').toLowerCase().includes('print'));
+                                    if (hasPrint) continue;  // 这是工具栏的 Download
+                                }
+                            }
+                            for (const w of group) {
+                                if (t === w || t.startsWith(w) || aria === w || aria.includes(w)) {
+                                    b.click();
+                                    return t || aria;
+                                }
+                            }
+                        }
+                    }
+                    return '';
+                }""")
+                if found:
+                    log(f"  JS 点击了按钮: {found}")
+                else:
+                    # 诊断: dump 页面上所有可见按钮
+                    try:
+                        btn_texts = page.evaluate("""() => {
+                            const btns = document.querySelectorAll('button, [role="button"], a, [type="submit"]');
+                            const texts = [];
+                            for (const b of btns) {
+                                const rect = b.getBoundingClientRect();
+                                if (rect.width === 0 || rect.height === 0) continue;
+                                if (b.offsetParent === null) continue;
+                                const t = (b.innerText || b.textContent || '').trim();
+                                const aria = b.getAttribute('aria-label') || '';
+                                if (t || aria) texts.push(t.substring(0, 40) + '|' + aria.substring(0, 20));
+                            }
+                            return texts;
+                        }""")
+                        log(f"  当前可见按钮: {btn_texts}")
+                    except Exception:
+                        pass
+                    raise RuntimeError("未找到动作按钮 (Continue/Download)")
+
+            if action_btn is not None:
+                log("  点击动作按钮触发下载")
+                try:
+                    action_btn.click(timeout=5000)
+                except Exception:
+                    try:
+                        action_btn.click(force=True, timeout=5000)
+                    except Exception:
+                        pass
+
+        # expect_download 成功捕获下载
         download = dl_info.value
         log(f"  下载成功: {download.suggested_filename}")
         download.save_as(str(target_path))
+
     except Exception as e:
-        # 下载事件未触发, 检查是否有新 tab 打开 (PDF 在新 tab 中)
+        # expect_download 超时, 检查是否有新 tab 打开
         log(f"  expect_download 超时: {e}")
         pages = page.context.pages if page.context else []
+        downloaded = False
         for p in reversed(pages):
             if p is not page:
                 try:
                     p.wait_for_load_state("domcontentloaded", timeout=10000)
                 except Exception:
                     pass
-                # 尝试从新 tab 的 URL 直接下载 PDF (不使用 page.pdf 打印)
                 new_url = p.url or ""
                 if new_url.lower().endswith(".pdf") or "application/pdf" in new_url.lower():
                     try:
-                        import urllib.request
-                        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                        req = urllib.request.Request(new_url)
+                        opener = _build_proxy_opener()
+                        req = __import__("urllib.request", fromlist=["Request"]).Request(new_url)
                         with opener.open(req, timeout=60) as resp:
                             data = resp.read()
                         with open(target_path, "wb") as f:
                             f.write(data)
                         log(f"  从新 tab URL 下载 PDF: {target_path}")
                         p.close()
+                        downloaded = True
                         break
                     except Exception as e2:
                         log(f"  从新 tab URL 下载 PDF 失败: {e2}")
-                # 回退: 检查新 tab 中是否有 iframe/embed 承载 PDF, 提取其 src 下载
                 try:
                     pdf_src = p.evaluate("""() => {
                         const el = document.querySelector('iframe[src*=".pdf"], embed[src*=".pdf"], object[data*=".pdf"]');
@@ -865,8 +1011,8 @@ def download_pdf(page, target_path: Path, page_type: str = "detail") -> Path:
                         return '';
                     }""")
                     if pdf_src:
+                        opener = _build_proxy_opener()
                         import urllib.request
-                        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
                         req = urllib.request.Request(pdf_src)
                         with opener.open(req, timeout=60) as resp:
                             data = resp.read()
@@ -874,19 +1020,19 @@ def download_pdf(page, target_path: Path, page_type: str = "detail") -> Path:
                             f.write(data)
                         log(f"  从 iframe/embed 下载 PDF: {target_path}")
                         p.close()
+                        downloaded = True
                         break
                 except Exception:
                     pass
                 p.close()
-        else:
-            raise RuntimeError(f"下载失败 (未触发下载事件且无新 tab PDF): {e}")
+        if not downloaded:
+            raise RuntimeError(f"下载失败: {e}")
 
     # 关闭可能残留的 dialog
-    if dialog is not None:
-        try:
-            dismiss_modal(page)
-        except Exception:
-            pass
+    try:
+        dismiss_modal(page)
+    except Exception:
+        pass
 
     log(f"  保存 PDF: {target_path}")
     return target_path
