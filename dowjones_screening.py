@@ -226,7 +226,7 @@ def login(page, base_url: str):
 
     # 5) 等待 oauth 回调跳回 riskcenter (URL 不再含 login/signin/oauthcallback)
     #    用轮询以兼容客户端重定向 (wait_for_url 对 SPA 跳转不可靠)
-    deadline = time.time() + TIMEOUT_MS / 1000 + 30
+    deadline = time.time() + TIMEOUT_MS / 1000 + 60
     landed = False
     saw_oauthcallback = False
     while time.time() < deadline:
@@ -247,7 +247,15 @@ def login(page, base_url: str):
             if not saw_oauthcallback:
                 saw_oauthcallback = True
                 log("  检测到 oauthcallback (已获 code), 等待 SPA 处理")
-                page.wait_for_timeout(3000)
+                # 等待 SPA 自行处理 code 交换 (最多 15 秒)
+                for _ in range(30):
+                    page.wait_for_timeout(500)
+                    cur = (page.url or "").lower()
+                    if "riskcenter.dowjones.com" in cur and "oauthcallback" not in cur and "login" not in cur and "signin" not in cur:
+                        landed = True
+                        break
+                if landed:
+                    break
                 # 仍未跳走 → reload 一次重试 SPA 的 code 交换 XHR
                 if "oauthcallback" in (page.url or "").lower():
                     log("  oauthcallback 未自动跳转, reload 重试 SPA code 交换")
@@ -255,7 +263,15 @@ def login(page, base_url: str):
                         page.reload(wait_until="domcontentloaded", timeout=TIMEOUT_MS)
                     except Exception:
                         pass
-                    page.wait_for_timeout(3000)
+                    # reload 后等待 SPA 处理 (最多 30 秒, 网络慢时 code 交换 XHR 需较长时间)
+                    for _ in range(60):
+                        page.wait_for_timeout(500)
+                        cur = (page.url or "").lower()
+                        if "riskcenter.dowjones.com" in cur and "oauthcallback" not in cur and "login" not in cur and "signin" not in cur:
+                            landed = True
+                            break
+                    if landed:
+                        break
                     # reload 仍未跳走 → 直接导航到 dashboard (SSO 可能已写入 session cookie)
                     if "oauthcallback" in (page.url or "").lower():
                         log("  reload 无效, 直接导航到 dashboard (依赖已设置的 session cookie)")
@@ -264,6 +280,10 @@ def login(page, base_url: str):
                         except Exception:
                             pass
                         page.wait_for_timeout(3000)
+                        cur = (page.url or "").lower()
+                        if "riskcenter.dowjones.com" in cur and "oauthcallback" not in cur:
+                            landed = True
+                            break
                     continue
         page.wait_for_timeout(500)
     if not landed and not _is_logged_in(page):
@@ -545,12 +565,244 @@ def stabilize_for_pdf(page):
         pass
 
 
-def save_search_result_pdf(page, input_name: str) -> Path:
+def click_print_button(page, context=None):
+    """点击页面上的 Print 按钮, 触发打印预览, 返回用于生成 PDF 的 page。
+
+    流程:
+    1. 拦截 window.print() (headless 模式下原生 print 会阻塞, 改为标记)
+    2. 点击 Print 按钮 (用 JS click 避免 overlay 拦截)
+    3. 若弹出确认对话框 (含 "Continue"/"Print" 按钮), 点击继续
+    4. 若弹出新 tab, 返回新 tab 的 page (打印预览在新 tab 中)
+    5. 否则返回当前 page, 由 page.pdf() 用 print media CSS 生成 PDF
+
+    返回: (target_page, used_print_button)
+    """
+    # 拦截 window.print(): headless 模式下原生 print 对话框无法显示且会阻塞,
+    # 改为标记被调用, 后续由 page.pdf() 用 print media CSS 生成 PDF
+    try:
+        page.evaluate("""
+            window.__printTriggered = false;
+            window.print = function() {
+                window.__printTriggered = true;
+            };
+        """)
+    except Exception:
+        pass
+
+    # 查找 Print 按钮 (排除页面其他含 "print" 文字的元素, 优先 button/svg 图标按钮)
+    print_selectors = [
+        'button:has-text("Print")',
+        'a:has-text("Print")',
+        '[role="button"]:has-text("Print")',
+        'button[aria-label*="print" i]',
+        'a[aria-label*="print" i]',
+        'button[title*="print" i]',
+        'a[title*="print" i]',
+        '[data-testid*="print" i]',
+    ]
+    print_btn = None
+    for sel in print_selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.is_visible(timeout=1000):
+                print_btn = loc
+                break
+        except Exception:
+            continue
+
+    if print_btn is None:
+        log("  未找到 Print 按钮, 直接 page.pdf()")
+        return page, False
+
+    # 监听新 tab 打开
+    new_pages = []
+    if context:
+        def _on_new_page(np):
+            new_pages.append(np)
+        context.on("page", _on_new_page)
+
+    # 直接用 JS click 避免 overlay 拦截导致的 5s 超时
+    log("  找到 Print 按钮, 点击")
+    try:
+        page.evaluate("""() => {
+            const btns = document.querySelectorAll('button, a, [role="button"]');
+            for (const b of btns) {
+                const t = (b.innerText || b.textContent || '').trim();
+                if (t.toLowerCase() === 'print') {
+                    b.click();
+                    return true;
+                }
+            }
+            // 回退: 含 print 的按钮
+            for (const b of btns) {
+                const t = (b.innerText || b.textContent || '').trim();
+                if (t.toLowerCase().includes('print')) {
+                    b.click();
+                    return true;
+                }
+            }
+            return false;
+        }""")
+    except Exception as e:
+        log(f"  Print 按钮 JS click 异常: {e}")
+
+    page.wait_for_timeout(2000)
+
+    # 检查是否有新 tab 打开 (打印预览在新 tab)
+    if new_pages:
+        log("  Print 按钮打开了新 tab, 使用新 tab 生成 PDF")
+        new_page = new_pages[0]
+        try:
+            new_page.wait_for_load_state("domcontentloaded", timeout=15000)
+        except Exception:
+            pass
+        return new_page, True
+
+    # 检查并点击确认对话框上的 "Continue"/"Print" 按钮 (Dow Jones 弹出确认框)
+    continue_clicked = _click_continue_in_dialog(page)
+    if continue_clicked:
+        page.wait_for_timeout(2000)
+        # 再次检查新 tab (点击 Continue 后可能打开新 tab)
+        if new_pages:
+            log("  Continue 后打开了新 tab, 使用新 tab 生成 PDF")
+            new_page = new_pages[0]
+            try:
+                new_page.wait_for_load_state("domcontentloaded", timeout=15000)
+            except Exception:
+                pass
+            return new_page, True
+
+    # 检查 window.print() 是否被调用
+    try:
+        triggered = page.evaluate("() => window.__printTriggered === true")
+        if triggered:
+            log("  window.print() 已触发, 用 print media CSS 生成 PDF")
+    except Exception:
+        pass
+
+    # 检查是否有 modal/popup 弹出 (打印预览在当前页 modal 中)
+    try:
+        modals = page.evaluate("""() => {
+            const modals = document.querySelectorAll(
+                '[class*="modal" i], [class*="dialog" i], [class*="popup" i], [role="dialog"], [class*="overlay" i]'
+            );
+            return Array.from(modals).filter(m => m.offsetParent !== null || m.offsetWidth > 0).length;
+        }""")
+        if modals > 0:
+            log("  Print 按钮弹出了 modal/popup, 在当前页用 print media 生成 PDF")
+    except Exception:
+        pass
+
+    return page, True
+
+
+def _click_continue_in_dialog(page):
+    """在 Print 按钮弹出的确认对话框上点击 "Continue"/"Print" 按钮以触发打印预览。
+    返回是否点击了继续按钮。
+    """
+    # 确认对话框按钮文案: Continue / Print / OK / Confirm / Yes
+    continue_selectors = [
+        'button:has-text("Continue")',
+        'button:has-text("Print")',
+        'button:has-text("OK")',
+        'button:has-text("Confirm")',
+        'button:has-text("Yes")',
+        '[role="button"]:has-text("Continue")',
+        'button[type="submit"]:has-text("Continue")',
+    ]
+    for sel in continue_selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.is_visible(timeout=1500):
+                log(f"  点击确认对话框按钮: {sel}")
+                try:
+                    loc.click(timeout=3000)
+                except Exception:
+                    # 用 JS click 避免 overlay 拦截
+                    page.evaluate(f"""() => {{
+                        const btns = document.querySelectorAll('button, [role="button"]');
+                        for (const b of btns) {{
+                            const t = (b.innerText || b.textContent || '').trim().toLowerCase();
+                            if (t === 'continue' || t === 'print' || t === 'ok' || t === 'confirm' || t === 'yes') {{
+                                b.click();
+                                return true;
+                            }}
+                        }}
+                        return false;
+                    }}""")
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def dismiss_modal(page):
+    """关闭页面上的 modal/popup (按 Escape, 点击关闭按钮, 点击 overlay)。"""
+    # 1) 按 Escape
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
+    # 2) 查找并点击关闭按钮
+    for sel in [
+        'button[aria-label*="close" i]',
+        'button[aria-label*="Close" i]',
+        'button:has-text("Close")',
+        'button:has-text("×")',
+        '[class*="close" i] button',
+        'button[class*="close" i]',
+    ]:
+        try:
+            loc = page.locator(sel).first
+            if loc.is_visible(timeout=500):
+                loc.click(timeout=2000)
+                page.wait_for_timeout(500)
+                break
+        except Exception:
+            continue
+    # 3) 点击 overlay (modal 外区域)
+    try:
+        page.evaluate("""() => {
+            const overlays = document.querySelectorAll(
+                '[class*="overlay" i], [class*="backdrop" i], [class*="scrim" i]'
+            );
+            for (const o of overlays) {
+                if (o.offsetParent !== null || o.offsetWidth > 0) {
+                    o.click();
+                    return true;
+                }
+            }
+            return false;
+        }""")
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+
+def save_search_result_pdf(page, input_name: str, context=None) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     path = OUTPUT_DIR / f"{sanitize(input_name)} - search result.pdf"
     stabilize_for_pdf(page)
-    page.pdf(path=str(path))
+    # 点击页面 Print 按钮, 触发打印预览并捕获用于生成 PDF 的 page
+    target_page, used_print = click_print_button(page, context)
+    # 切换到 print media CSS, 让 page.pdf() 渲染打印预览版本 (隐藏导航/工具栏等 UI)
+    try:
+        target_page.emulate_media(media="print")
+    except Exception:
+        pass
+    try:
+        target_page.pdf(path=str(path), print_background=True)
+    finally:
+        # 还原 screen media, 避免影响后续页面交互
+        try:
+            target_page.emulate_media(media="screen")
+        except Exception:
+            pass
     log(f"  保存搜索结果 PDF: {path}")
+    # 关闭 Print 弹出的 modal/popup, 避免拦截后续操作
+    if used_print and target_page is page:
+        dismiss_modal(page)
     return path
 
 
@@ -606,19 +858,37 @@ def extract_result_name(page, clicked_text: str) -> str:
     return clicked_text
 
 
-def save_detail_pdf(page, input_name: str, result_name: str, profile_id: str) -> Path:
+def save_detail_pdf(page, input_name: str, result_name: str, profile_id: str, context=None) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    path = OUTPUT_DIR / f"{sanitize(result_name)} - {sanitize(profile_id)}.pdf"
+    # 用 input_name (模板输入名) 命名, 与 search result PDF 保持一致
+    path = OUTPUT_DIR / f"{sanitize(input_name)} - {sanitize(profile_id)}.pdf"
     stabilize_for_pdf(page)
-    page.pdf(path=str(path))
+    # 点击页面 Print 按钮, 触发打印预览并捕获用于生成 PDF 的 page
+    target_page, used_print = click_print_button(page, context)
+    # 切换到 print media CSS, 让 page.pdf() 渲染打印预览版本 (隐藏导航/工具栏等 UI)
+    try:
+        target_page.emulate_media(media="print")
+    except Exception:
+        pass
+    try:
+        target_page.pdf(path=str(path), print_background=True)
+    finally:
+        # 还原 screen media, 避免影响后续页面交互
+        try:
+            target_page.emulate_media(media="screen")
+        except Exception:
+            pass
     log(f"  保存详情 PDF: {path}")
+    # 关闭 Print 弹出的 modal/popup, 避免拦截后续操作
+    if used_print and target_page is page:
+        dismiss_modal(page)
     return path
 
 
 # ---------------------------------------------------------------------------
 # 单行处理
 # ---------------------------------------------------------------------------
-def process_one(page, row, search_url: str):
+def process_one(page, row, search_url: str, context=None):
     """处理单行名单, 返回 summary dict。"""
     input_name = row["name"]
     log(f"=== 处理: type={row['type']} name={input_name!r} ===")
@@ -634,7 +904,7 @@ def process_one(page, row, search_url: str):
         open_advanced_search(page, search_url)
         select_search_type(page, row["type"])
         fill_name_and_search(page, input_name)
-        save_search_result_pdf(page, input_name)
+        save_search_result_pdf(page, input_name, context)
         summary["pdfs"] = f"{sanitize(input_name)} - search result.pdf"
 
         results = detect_results(page)
@@ -691,7 +961,7 @@ def process_one(page, row, search_url: str):
                 continue
 
             result_name = extract_result_name(page, clicked_text)
-            detail_pdf = save_detail_pdf(page, input_name, result_name, profile_id)
+            detail_pdf = save_detail_pdf(page, input_name, result_name, profile_id, context)
             detail_pdfs.append(detail_pdf.name)
 
             # 返回结果页以便点击下一项 (若仍有)
@@ -723,7 +993,8 @@ def process_one(page, row, search_url: str):
 # 汇总
 # ---------------------------------------------------------------------------
 def write_summary(records, path: Path):
-    with open(path, "w", newline="", encoding="utf-8") as f:
+    # 用 utf-8-sig (带 BOM) 写入, Excel 打开不乱码
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(
             f, fieldnames=["type", "name", "status", "pdfs", "error"]
         )
@@ -777,6 +1048,11 @@ def main():
         or ""
     )
     launch_kwargs = {"headless": headless}
+    # 使用 puppeteer 已安装的 chrome (playwright 自带 chromium 未安装时)
+    puppeteer_chrome = "/root/.cache/puppeteer/chrome/linux-151.0.7922.71/chrome-linux64/chrome"
+    if os.path.exists(puppeteer_chrome):
+        launch_kwargs["executable_path"] = puppeteer_chrome
+        log(f"使用 chrome: {puppeteer_chrome}")
     if proxy_url:
         launch_kwargs["proxy"] = {"server": proxy_url}
         log(f"使用 egress 代理: {proxy_url}")
@@ -790,16 +1066,16 @@ def main():
         # 登录 (整个流程复用同一会话); 带重试应对网络抖动 / oauthcallback 偶发不跳转
         login_ok = False
         last_login_err = None
-        for attempt in range(1, 4):
+        for attempt in range(1, 6):
             try:
-                log(f"登录尝试 {attempt}/3")
+                log(f"登录尝试 {attempt}/5")
                 login(page, DJ_BASE_URL)
                 login_ok = True
                 break
             except Exception as e:
                 last_login_err = e
-                log(f"  登录失败 ({attempt}/3): {type(e).__name__}: {e}")
-                if attempt < 3:
+                log(f"  登录失败 ({attempt}/5): {type(e).__name__}: {e}")
+                if attempt < 5:
                     # 重试前清空 cookies, 确保 SSO 重定向链从干净状态重新触发
                     # (上次失败可能残留半截 SSO cookie, 导致 riskcenter 不再展示 #okBtn / 登录表单)
                     try:
@@ -828,7 +1104,7 @@ def main():
 
         # 逐行处理
         for row in rows:
-            rec = process_one(page, row, DJ_ADVANCED_SEARCH_URL)
+            rec = process_one(page, row, DJ_ADVANCED_SEARCH_URL, context)
             records.append(rec)
 
         browser.close()
