@@ -1159,97 +1159,94 @@ def extract_detail_info(page, page_type: str = "detail") -> dict:
         "notes_keyword_hit": "",
     }
 
-    # 诊断: dump 详情页上方区域所有小元素 (调试 risk flag)
+    # 诊断: dump 详情页上方区域所有短文本元素 (调试 risk flag)
     try:
         debug_flags = page.evaluate("""() => {
             const results = [];
-            const allEls = document.querySelectorAll('span, div, p, a, li');
+            const allEls = document.querySelectorAll('span, div, p, a, li, td, th, button');
             for (const el of allEls) {
                 const rect = el.getBoundingClientRect();
-                if (rect.width < 10 || rect.width > 300) continue;
-                if (rect.height < 8 || rect.height > 50) continue;
+                if (rect.width < 5 || rect.width > 300) continue;
+                if (rect.height < 5 || rect.height > 50) continue;
                 if (el.offsetParent === null) continue;
-                if (rect.top > 400) continue;
+                if (rect.top > 500) continue;
                 const t = (el.innerText || el.textContent || '').trim();
-                if (t && t.length > 0 && t.length < 50) {
+                if (t && t.length > 0 && t.length < 30) {
                     const style = window.getComputedStyle(el);
                     results.push({
-                        text: t.substring(0, 30),
+                        text: t.substring(0, 20),
                         top: Math.round(rect.top),
+                        left: Math.round(rect.left),
                         bg: style.backgroundColor,
-                        border: style.borderColor,
                         cls: (el.className || '').toString().substring(0, 50),
                     });
                 }
             }
-            return results.slice(0, 15);
+            return results.slice(0, 30);
         }""")
         if debug_flags:
-            log(f"  [debug] 页面上方小元素 (含无边框): {debug_flags[:15]}")
+            log(f"  [debug] 页面上方短文本: {debug_flags[:20]}")
     except Exception:
         pass
 
     # --- 1. Risk flags ---
-    # Dow Jones 详情页顶部的 risk flag (如 OOL, PEP, AM, SEM, SL, FEC)
-    # 可能是带背景色/边框色的标签, 也可能是纯文字标签
-    # 策略: 在页面上方区域 (top < 400) 找已知的 risk flag 缩写, 或找有颜色的标签
+    # Dow Jones 详情页顶部的 risk flag 是简短的大写缩写 (如 OOL, PEP, AM, RCA)
+    # 策略: 找所有 2-6 字符的全大写文本, 排除侧边栏导航 (left<50) 和表格表头 (TH)
     try:
         flags = page.evaluate("""() => {
-            // 已知的 Dow Jones Risk Center risk flag 缩写
-            const knownFlags = ['OOL', 'PEP', 'AM', 'SEM', 'SL', 'FEC', 'REL', 'POI',
-                'SIP', 'SAN', 'SOC', 'PEP', 'OEL', 'DEL', 'SOCM', 'SANCTION',
-                'Adverse Media', 'Sanctions', 'State-Owned', 'Regulatory',
-                'Financial Crime', 'Law Enforcement', 'Politically Exposed',
-                'Other Excluded', 'Special Interest', 'Sanctioned Entity'];
+            // 排除导航/状态/表头等非 risk flag 的元素
+            const excludeTexts = new Set([
+                'active', 'inactive', 'search', 'download', 'print', 'email',
+                'continue', 'ok', 'cancel', 'close', 'risk', 'flags',
+                'gri', 'fcc', 'tprm', 'skip to menu', 'skip to header', 'skip to content',
+                'entity', 'person', 'back', 'next', 'previous', 'modify',
+                'summary', 'simple', 'advanced', 'export', 'disclaimer',
+                'privacy', 'cookie', 'terms',
+                // 表格表头文字
+                'name', 'prefix', 'suffix', 'title', 'ubo', 'category',
+                'type', 'role', 'status', 'country', 'address', 'date',
+                'gender', 'age', 'birth', 'nationality', 'source',
+            ]);
 
             const results = [];
             const seen = new Set();
-            const allEls = document.querySelectorAll('span, div, p, a, li, td, th');
+            const allEls = document.querySelectorAll('span, div, p, a, li, td, button');
             for (const el of allEls) {
                 const rect = el.getBoundingClientRect();
-                if (rect.width < 10 || rect.width > 300) continue;
-                if (rect.height < 8 || rect.height > 50) continue;
+                if (rect.width < 5 || rect.width > 300) continue;
+                if (rect.height < 5 || rect.height > 50) continue;
                 if (el.offsetParent === null) continue;
-                // 只看页面上方区域
-                if (rect.top > 400) continue;
+                if (rect.top > 500) continue;
+                // 排除侧边栏 (left < 50 的是左侧导航)
+                if (rect.left < 50) continue;
 
                 const t = (el.innerText || el.textContent || '').trim();
-                if (!t || t.length === 0 || t.length > 50) continue;
+                if (!t || t.length < 2 || t.length > 15) continue;
 
-                // 排除通用 UI 文字和状态标签
                 const lower = t.toLowerCase();
-                if (lower === 'active' || lower === 'inactive' ||
-                    lower === 'search' || lower === 'download' || lower === 'print' ||
-                    lower === 'email' || lower === 'continue' ||
-                    lower === 'ok' || lower === 'cancel' || lower === 'close' ||
-                    lower.includes('disclaimer') || lower.includes('privacy') ||
-                    lower.includes('cookie') || lower.includes('terms') ||
-                    lower === 'risk' || lower === 'flags' || lower === 'risk flags') continue;
+                if (excludeTexts.has(lower)) continue;
 
-                // 方法 1: 精确匹配已知 risk flag
-                const isKnown = knownFlags.some(f =>
-                    t === f || t.toLowerCase() === f.toLowerCase());
-                if (isKnown && !seen.has(t)) {
-                    seen.add(t);
-                    results.push(t);
-                    continue;
-                }
-
-                // 方法 2: 有背景色或边框色的小标签 (排除白色/透明)
-                const style = window.getComputedStyle(el);
-                const bg = style.backgroundColor;
-                const border = style.borderTopColor;
-                const hasBgColor = bg && bg !== 'transparent' &&
-                    bg !== 'rgba(0, 0, 0, 0)' &&
-                    !bg.includes('255, 255, 255');
-                const hasBorder = border && border !== 'transparent' &&
-                    border !== 'rgba(0, 0, 0, 0)' &&
-                    !border.includes('255, 255, 255') &&
-                    style.borderTopWidth !== '0px';
-
-                if ((hasBgColor || hasBorder) && !seen.has(t) && t.length <= 20) {
-                    seen.add(t);
-                    results.push(t);
+                // risk flag 是全大写的短文本 (2-6 字符, 只含字母)
+                // 如 OOL, PEP, AM, RCA, SEM, SL, FEC, REL
+                if (/^[A-Z]{2,6}$/.test(t) && !seen.has(t)) {
+                    // 排除父元素是导航栏/表格的
+                    let parent = el.parentElement;
+                    let isNav = false;
+                    for (let i = 0; i < 3 && parent; i++) {
+                        const pcls = (parent.className || '').toString().toLowerCase();
+                        const ptag = parent.tagName.toLowerCase();
+                        if (ptag === 'nav' || pcls.includes('nav') ||
+                            pcls.includes('sidebar') || pcls.includes('menu') ||
+                            ptag === 'table' || ptag === 'thead') {
+                            isNav = true;
+                            break;
+                        }
+                        parent = parent.parentElement;
+                    }
+                    if (!isNav) {
+                        seen.add(t);
+                        results.push(t);
+                    }
                 }
             }
 
@@ -1335,82 +1332,136 @@ def extract_detail_info(page, page_type: str = "detail") -> dict:
         log(f"  提取 original script name 失败: {e}")
 
     # --- 3. Profile notes (只保留正文, 过滤翻译控件/disclaimer) ---
-    # Profile Notes 区域结构: 标题 "Profile Notes" (BUTTON/DIV) → 正文内容 → 翻译控件
-    # 需要跳过 "Translate to:", "English", "Translate", "powered by..." 等翻译 UI
+    # DOM 结构: "Profile Notes" 标题 (BUTTON/DIV) + 翻译控件 在一个容器中
+    # 实际正文内容在另一个相邻的兄弟元素中
     try:
         notes = page.evaluate("""() => {
-            // 方法 1: 找 "Profile Notes" 标题元素, 向上找父容器, 再在父容器中提取正文
             const allEls = document.querySelectorAll('*');
-            let notesContainer = null;
+
+            // 方法 1: 找 "Profile Notes" 标题, 向上找 section 容器,
+            // 然后在 section 的所有子元素中找含长文本的元素 (排除翻译控件)
             for (const el of allEls) {
                 const t = (el.innerText || el.textContent || '').trim();
                 if (t === 'Profile Notes' || t === 'PROFILE NOTES') {
-                    // 向上查找包含正文内容的父容器
-                    let parent = el.parentElement;
-                    for (let i = 0; i < 5 && parent; i++) {
-                        const fullText = (parent.innerText || parent.textContent || '').trim();
-                        // 父容器应该比标题本身长很多 (包含正文)
-                        if (fullText.length > 50) {
-                            notesContainer = parent;
-                            break;
+                    // 向上找 section 容器 (3-5 层)
+                    let section = el;
+                    for (let i = 0; i < 6; i++) {
+                        section = section.parentElement;
+                        if (!section) break;
+                        const sectionText = (section.innerText || section.textContent || '').trim();
+                        // section 应包含大量文本 (>100 字符)
+                        if (sectionText.length > 100) {
+                            // 在 section 的所有后代中找有长文本的叶子元素
+                            const descendants = section.querySelectorAll('*');
+                            let bestText = '';
+                            let bestLen = 0;
+                            for (const d of descendants) {
+                                // 只看叶子元素 (无子元素或有很短子元素)
+                                const dText = (d.innerText || d.textContent || '').trim();
+                                // 排除翻译控件和 UI 文字
+                                const dLower = dText.toLowerCase();
+                                if (dLower.includes('translate to') ||
+                                    dLower.includes('powered by') ||
+                                    dLower.includes('google') ||
+                                    dLower === 'english' || dLower === 'translate' ||
+                                    dLower.includes('machine translation') ||
+                                    dLower === 'profile notes' ||
+                                    dLower.includes('disclaimer') ||
+                                    dLower.includes('privacy') ||
+                                    dLower.includes('cookie') ||
+                                    dLower.includes('terms of use') ||
+                                    dLower.includes('copyright') ||
+                                    dLower.includes('©') ||
+                                    dLower.includes('linguistic search')) continue;
+                                // 找最长的文本块 (正文通常最长)
+                                if (dText.length > bestLen && dText.length > 20) {
+                                    // 确认是叶子 (子元素文本总长 ≈ 自身文本长)
+                                    let childTextLen = 0;
+                                    for (const c of d.children) {
+                                        childTextLen += (c.innerText || c.textContent || '').length;
+                                    }
+                                    if (childTextLen < dText.length * 0.5 || d.children.length === 0) {
+                                        bestText = dText;
+                                        bestLen = dText.length;
+                                    }
+                                }
+                            }
+                            if (bestText) {
+                                // 过滤翻译/disclaimer 行
+                                const lines = bestText.split('\\n');
+                                const clean = [];
+                                let skip = false;
+                                for (const line of lines) {
+                                    const s = line.trim();
+                                    if (!s) continue;
+                                    const sl = s.toLowerCase();
+                                    if (sl.includes('translate to') || sl.includes('powered by') ||
+                                        sl === 'english' || sl === 'translate' ||
+                                        sl.includes('google') || sl.includes('machine translation') ||
+                                        sl.includes('disclaimer') || sl.includes('privacy') ||
+                                        sl.includes('cookie') || sl.includes('terms') ||
+                                        sl.includes('©') || sl.includes('copyright') ||
+                                        sl === 'profile notes' ||
+                                        sl.includes('linguistic search')) {
+                                        skip = true;
+                                        continue;
+                                    }
+                                    if (skip) continue;
+                                    clean.push(s);
+                                }
+                                if (clean.length > 0) {
+                                    return clean.join('\\n');
+                                }
+                            }
                         }
-                        parent = parent.parentElement;
                     }
-                    if (notesContainer) break;
                 }
             }
 
-            if (notesContainer) {
-                // 提取 notesContainer 中所有文本节点, 过滤翻译控件
-                const allText = (notesContainer.innerText || notesContainer.textContent || '').trim();
-                // 过滤翻译控件文字
-                const lines = allText.split('\\n');
-                const cleanLines = [];
-                let foundTranslateUI = false;
-                for (const line of lines) {
-                    const stripped = line.trim();
-                    if (!stripped) continue;
-                    const lower = stripped.toLowerCase();
-                    // 跳过 "Profile Notes" 标题本身
-                    if (lower === 'profile notes' || lower === 'profile notes') continue;
-                    // 遇到翻译控件, 标记并跳过后续
-                    if (lower.includes('translate to') || lower.includes('powered by') ||
-                        lower === 'english' || lower === 'translate' ||
-                        lower.includes('google') || lower.includes('machine translation')) {
-                        foundTranslateUI = true;
-                        continue;
-                    }
-                    if (foundTranslateUI) continue;
-                    cleanLines.push(stripped);
-                }
-                if (cleanLines.length > 0) {
-                    return cleanLines.join('\\n');
-                }
-            }
-
-            // 方法 2: 找 Profile Notes 标题, 取父元素的下一个兄弟
+            // 方法 2: 找 "Profile Notes" 标题, 依次检查所有后续兄弟元素
             for (const el of allEls) {
                 const t = (el.innerText || el.textContent || '').trim();
                 if (t === 'Profile Notes' || t === 'PROFILE NOTES') {
-                    const parent = el.parentElement;
-                    if (parent) {
-                        const pnext = parent.nextElementSibling;
-                        if (pnext) {
-                            const v = (pnext.innerText || pnext.textContent || '').trim();
-                            if (v && v.length > 10) return v;
+                    let sib = el.nextElementSibling;
+                    while (sib) {
+                        const sibText = (sib.innerText || sib.textContent || '').trim();
+                        // 跳过翻译控件
+                        const sl = sibText.toLowerCase();
+                        if (sl.includes('translate to') || sl.includes('powered by') ||
+                            sl === 'english' || sl === 'translate') {
+                            sib = sib.nextElementSibling;
+                            continue;
                         }
+                        if (sibText.length > 20) {
+                            return sibText;
+                        }
+                        sib = sib.nextElementSibling;
+                    }
+                    // 也检查父元素的后续兄弟
+                    let psib = el.parentElement ? el.parentElement.nextElementSibling : null;
+                    while (psib) {
+                        const psibText = (psib.innerText || psib.textContent || '').trim();
+                        const psl = psibText.toLowerCase();
+                        if (psl.includes('translate to') || psl.includes('powered by')) {
+                            psib = psib.nextElementSibling;
+                            continue;
+                        }
+                        if (psibText.length > 20) {
+                            return psibText;
+                        }
+                        psib = psib.nextElementSibling;
                     }
                 }
             }
 
-            // 方法 3: data-testid
+            // 方法 3: data-testid / class
             const noteEls = document.querySelectorAll(
                 '[data-testid*="profile-note" i], [data-testid*="note" i], ' +
                 '[class*="profile-note" i]'
             );
             for (const el of noteEls) {
                 const t = (el.innerText || el.textContent || '').trim();
-                if (t && t.length > 10) return t;
+                if (t && t.length > 20) return t;
             }
             return '';
         }""")
