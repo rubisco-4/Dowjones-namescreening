@@ -1149,7 +1149,7 @@ def extract_detail_info(page, page_type: str = "detail") -> dict:
     返回 dict:
       risk_flags: str    - 页面顶部有颜色的 risk flag 标签 (逗号分隔)
       original_script_name: str - name 栏里的 original script name
-      profile_notes: str  - profile notes 全文
+      profile_notes: str  - profile notes 正文内容
       notes_keyword_hit: str - profile notes 中是否含关键词 (fine/warning/罚款/警告)
     """
     info = {
@@ -1159,151 +1159,242 @@ def extract_detail_info(page, page_type: str = "detail") -> dict:
         "notes_keyword_hit": "",
     }
 
-    # --- 1. Risk flags: 页面顶部的有色标签 ---
-    # Risk Center 的 risk flag 常见为带背景色的 badge/tag, 如 "PEP", "Sanction", "Adverse Media"
+    # 诊断: dump 详情页上方区域所有带背景色的小元素 (调试 risk flag 提取)
+    try:
+        debug_flags = page.evaluate("""() => {
+            const results = [];
+            const allEls = document.querySelectorAll('span, div, p, a, button, li');
+            for (const el of allEls) {
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 10 || rect.width > 300) continue;
+                if (rect.height < 8 || rect.height > 50) continue;
+                if (el.offsetParent === null) continue;
+                if (rect.top > 600) continue;
+                const style = window.getComputedStyle(el);
+                const bg = style.backgroundColor;
+                if (!bg || bg === 'transparent' || bg === 'rgba(0, 0, 0, 0)') continue;
+                const t = (el.innerText || el.textContent || '').trim();
+                if (t && t.length > 0 && t.length < 50) {
+                    results.push({
+                        text: t.substring(0, 30),
+                        bg: bg,
+                        top: Math.round(rect.top),
+                        w: Math.round(rect.width),
+                        h: Math.round(rect.height),
+                        cls: (el.className || '').toString().substring(0, 40),
+                    });
+                }
+            }
+            return results;
+        }""")
+        if debug_flags:
+            log(f"  [debug] 页面上方带背景色的小元素: {debug_flags[:10]}")
+    except Exception:
+        pass
+
+    # 诊断: dump 含 "Original Script" 或 "Profile Notes" 的元素结构
+    try:
+        debug_fields = page.evaluate("""() => {
+            const results = [];
+            const allEls = document.querySelectorAll('*');
+            for (const el of allEls) {
+                const t = (el.innerText || el.textContent || '').trim();
+                if (t.length > 100) continue;
+                if (t.toLowerCase().includes('original script') ||
+                    t.toLowerCase().includes('profile notes')) {
+                    const parent = el.parentElement;
+                    const sibling = el.nextElementSibling;
+                    results.push({
+                        text: t.substring(0, 60),
+                        tag: el.tagName,
+                        cls: (el.className || '').toString().substring(0, 40),
+                        parentCls: parent ? (parent.className || '').toString().substring(0, 40) : '',
+                        siblingText: sibling ? (sibling.innerText || '').substring(0, 40) : '',
+                    });
+                }
+            }
+            return results.slice(0, 5);
+        }""")
+        if debug_fields:
+            log(f"  [debug] Original Script/Profile Notes 相关元素: {debug_fields}")
+    except Exception:
+        pass
+
+    # --- 1. Risk flags: 页面顶部有颜色的标签 (如 OOL, PEP, Sanction, AM) ---
     try:
         flags = page.evaluate("""() => {
             const results = [];
-            // 方法 1: 查找页面顶部区域 (header/summary) 中的 badge/tag 元素
-            // 常见 class: risk-flag, badge, tag, chip, alert, flag
-            const topArea = document.querySelector(
-                '[class*="risk" i][class*="flag" i], ' +
-                '[class*="summary" i], ' +
-                '[class*="header" i][class*="profile" i], ' +
-                '[data-testid*="risk" i], ' +
-                '[class*="flag" i]'
-            );
-            const root = topArea || document;
-            // 查找带背景色的 badge 元素
-            const candidates = root.querySelectorAll(
-                '[class*="badge" i], [class*="tag" i], [class*="chip" i], ' +
-                '[class*="flag" i], [class*="alert" i], [class*="risk" i], ' +
-                '[class*="pill" i], [class*="label" i][class*="risk" i]'
-            );
-            for (const el of candidates) {
+            const seen = new Set();
+
+            // Dow Jones Risk Center 的 risk flag 是页面上方的小标签,
+            // 通常是有背景色的 span/div, 文字短 (如 "OOL", "PEP", "AM")
+            // 搜索策略: 找所有有非透明背景色的小元素 (位于页面上方)
+
+            const allEls = document.querySelectorAll('span, div, p, a, button, li');
+            for (const el of allEls) {
                 const rect = el.getBoundingClientRect();
-                if (rect.width < 10 || rect.height < 5) continue;
+                if (rect.width < 15 || rect.width > 200) continue;
+                if (rect.height < 10 || rect.height > 40) continue;
                 if (el.offsetParent === null) continue;
+                // 只看页面上方区域
+                if (rect.top > 600) continue;
+
+                const style = window.getComputedStyle(el);
+                const bg = style.backgroundColor;
+                const bgImg = style.backgroundImage;
+
+                // 必须有非透明背景色 (排除白色背景)
+                const hasBgColor = bg && bg !== 'transparent' &&
+                    bg !== 'rgba(0, 0, 0, 0)' &&
+                    !bg.includes('rgba(255, 255, 255') &&
+                    !bg.includes('rgb(255, 255, 255');
+
+                if (!hasBgColor) continue;
+
                 const t = (el.innerText || el.textContent || '').trim();
-                if (t && t.length < 50 && !results.includes(t)) {
-                    // 排除通用 UI 文字
-                    const lower = t.toLowerCase();
-                    if (lower === 'risk' || lower === 'flags' || lower === 'risk flags') continue;
+                if (!t || t.length === 0 || t.length > 30) continue;
+
+                // 排除通用 UI 文字
+                const lower = t.toLowerCase();
+                if (lower === 'risk' || lower === 'flags' || lower === 'risk flags' ||
+                    lower === 'search' || lower === 'download' || lower === 'print' ||
+                    lower === 'email' || lower === 'modify search' ||
+                    lower === 'search summary' || lower === 'simple search' ||
+                    lower === 'advanced search' || lower === 'continue' ||
+                    lower === 'ok' || lower === 'cancel' || lower === 'close' ||
+                    lower.includes('disclaimer') || lower.includes('privacy') ||
+                    lower.includes('cookie') || lower.includes('terms')) continue;
+
+                // 排除子元素已包含的情况 (避免重复)
+                let parent = el.parentElement;
+                let isChildOfExisting = false;
+                while (parent && !isChildOfExisting) {
+                    if (seen.has(parent)) isChildOfExisting = true;
+                    parent = parent.parentElement;
+                }
+
+                if (!isChildOfExisting && !seen.has(el)) {
+                    seen.add(el);
                     results.push(t);
                 }
             }
-            // 方法 2: 如果方法 1 没找到, 全局搜索带背景色的 span/div
-            if (results.length === 0) {
-                const allTags = document.querySelectorAll('span, div, p');
-                for (const el of allTags) {
-                    const style = window.getComputedStyle(el);
-                    const bg = style.backgroundColor;
-                    // 检查是否有非透明背景色 (rgb 格式, 非 transparent)
-                    if (bg && bg !== 'transparent' && bg !== 'rgba(0, 0, 0, 0)') {
-                        const rect = el.getBoundingClientRect();
-                        // 只找小标签 (宽度 < 200, 高度 < 40)
-                        if (rect.width > 15 && rect.width < 200 &&
-                            rect.height > 10 && rect.height < 40 &&
-                            el.offsetParent !== null) {
-                            const t = (el.innerText || '').trim();
-                            if (t && t.length < 50 && !results.includes(t)) {
-                                const lower = t.toLowerCase();
-                                if (lower === 'risk' || lower === 'flags' || lower === 'risk flags') continue;
-                                // 检查是否在顶部区域 (y < 500)
-                                if (rect.top < 500) {
-                                    results.push(t);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+
             return results;
         }""")
         if flags:
             info["risk_flags"] = ", ".join(flags)
             log(f"  Risk flags: {info['risk_flags']}")
+        else:
+            log(f"  Risk flags: (未找到)")
     except Exception as e:
         log(f"  提取 risk flags 失败: {e}")
 
-    # --- 2. Original script name: name 栏里的 original script name ---
+    # --- 2. Original script name ---
+    # Dow Jones 详情页有 "Original Script Name" 字段, 显示非罗马字符的原文名
     try:
         script_name = page.evaluate("""() => {
-            // 查找 "Original Script Name" 或 "Also Known As" 或 "Original Name" 附近文本
-            const labels = ['Original Script Name', 'Original Name', 'Also Known As',
-                            'Original Script', '原文名', '别名'];
-            const allEls = document.querySelectorAll('dt, dd, th, td, span, div, p, label');
+            // 方法 1: 精确匹配 "Original Script Name" 标签
+            const allEls = document.querySelectorAll('*');
             for (const el of allEls) {
                 const t = (el.innerText || el.textContent || '').trim();
-                for (const label of labels) {
-                    if (t.toLowerCase().startsWith(label.toLowerCase())) {
-                        // 提取冒号后的值
-                        const m = t.match(/[:：]\\s*(.+)/);
-                        if (m) return m[1].trim();
-                        // 或者查找下一个兄弟元素
-                        const next = el.nextElementSibling;
-                        if (next) {
-                            const v = (next.innerText || next.textContent || '').trim();
-                            if (v) return v;
+                // 精确匹配标签文字 (不是包含, 是等于或以该文字开头)
+                if (t === 'Original Script Name' || t === 'Original Name' ||
+                    t === 'Original Script' || t === 'Also Known As') {
+                    // 找到了标签, 查找相邻的值元素
+                    // 方式 a: 下一个兄弟元素
+                    let next = el.nextElementSibling;
+                    if (next) {
+                        const v = (next.innerText || next.textContent || '').trim();
+                        if (v && v !== t) return v;
+                    }
+                    // 方式 b: 父元素的下一个兄弟
+                    const parent = el.parentElement;
+                    if (parent) {
+                        const pnext = parent.nextElementSibling;
+                        if (pnext) {
+                            const v = (pnext.innerText || pnext.textContent || '').trim();
+                            if (v && v !== t) return v;
+                        }
+                        // 方式 c: 父元素内的其他子元素
+                        const siblings = parent.children;
+                        for (const sib of siblings) {
+                            if (sib === el) continue;
+                            const v = (sib.innerText || sib.textContent || '').trim();
+                            if (v && v !== t) return v;
                         }
                     }
+                    // 方式 d: 同元素中冒号后的内容
+                    const m = t.match(/[:：]\\s*(.+)/);
+                    if (m) return m[1].trim();
                 }
             }
-            // 方法 2: 查找包含 "original" 或 "script" 的 data-testid
-            const testIds = document.querySelectorAll('[data-testid*="original" i], [data-testid*="script" i]');
-            for (const el of testIds) {
+            // 方法 2: 查找包含 "original script" 的 data-testid 或 data-label
+            const labeled = document.querySelectorAll(
+                '[data-testid*="original" i], [data-testid*="script" i], ' +
+                '[data-label*="original" i], [data-field*="original" i]'
+            );
+            for (const el of labeled) {
                 const t = (el.innerText || el.textContent || '').trim();
-                if (t) return t.substring(0, 200);
+                // 尝试提取标签后的值
+                const m = t.match(/Original Script Name[:：]?\\s*(.+)/i);
+                if (m) return m[1].trim();
+                // 如果元素本身不是标签而是值
+                if (t && !t.toLowerCase().includes('original script name')) return t.substring(0, 200);
             }
+            // 方法 3: 查找含 "Original Script Name" 文本的元素, 用正则提取冒号后的值
+            const allText = document.body.innerText || '';
+            const m2 = allText.match(/Original Script Name\\s*[:：]?\\s*([^\\n\\r]+)/i);
+            if (m2) return m2[1].trim();
             return '';
         }""")
         if script_name:
             info["original_script_name"] = script_name
             log(f"  Original script name: {script_name}")
+        else:
+            log(f"  Original script name: (未找到)")
     except Exception as e:
         log(f"  提取 original script name 失败: {e}")
 
-    # --- 3. Profile notes ---
+    # --- 3. Profile notes (只保留正文, 过滤 disclaimer/翻译文字) ---
     try:
         notes = page.evaluate("""() => {
-            // 查找 Profile Notes 区域
-            const labels = ['Profile Notes', 'profile notes', 'PROFILE NOTES', 'Notes'];
-            // 方法 1: 查找标题/标签元素, 然后取相邻的内容区域
-            const allEls = document.querySelectorAll('h1, h2, h3, h4, h5, h6, dt, th, span, div, p, label');
+            // 方法 1: 精确匹配 "Profile Notes" 标签, 取相邻内容
+            const allEls = document.querySelectorAll('*');
             for (const el of allEls) {
                 const t = (el.innerText || el.textContent || '').trim();
-                for (const label of labels) {
-                    if (t === label || t.toLowerCase() === label.toLowerCase()) {
-                        // 查找下一个兄弟元素或父元素的下一个子元素
-                        let next = el.nextElementSibling;
-                        if (next) {
-                            const v = (next.innerText || next.textContent || '').trim();
+                if (t === 'Profile Notes' || t === 'PROFILE NOTES') {
+                    // 找到了标签, 查找相邻的值元素
+                    let next = el.nextElementSibling;
+                    if (next) {
+                        const v = (next.innerText || next.textContent || '').trim();
+                        if (v && v.length > 5) return v;
+                    }
+                    const parent = el.parentElement;
+                    if (parent) {
+                        const pnext = parent.nextElementSibling;
+                        if (pnext) {
+                            const v = (pnext.innerText || pnext.textContent || '').trim();
                             if (v && v.length > 5) return v;
                         }
-                        // 查找父元素的下一个兄弟
-                        const parent = el.parentElement;
-                        if (parent) {
-                            const pnext = parent.nextElementSibling;
-                            if (pnext) {
-                                const v = (pnext.innerText || pnext.textContent || '').trim();
-                                if (v && v.length > 5) return v;
-                            }
+                        const siblings = parent.children;
+                        for (const sib of siblings) {
+                            if (sib === el) continue;
+                            const v = (sib.innerText || sib.textContent || '').trim();
+                            if (v && v.length > 5) return v;
                         }
-                        // 或者在同一元素中提取冒号后的内容
-                        const m = t.match(/[:：]\\s*(.+)/s);
-                        if (m) return m[1].trim();
                     }
                 }
             }
             // 方法 2: data-testid
             const noteEls = document.querySelectorAll(
-                '[data-testid*="note" i], [class*="profile-note" i], [class*="note" i][class*="content" i]'
+                '[data-testid*="profile-note" i], [data-testid*="note" i], ' +
+                '[class*="profile-note" i], [class*="note" i][class*="content" i]'
             );
             for (const el of noteEls) {
                 const t = (el.innerText || el.textContent || '').trim();
                 if (t && t.length > 10) return t;
             }
-            // 方法 3: 查找 textarea 或 pre 元素 (notes 可能是可编辑区域)
+            // 方法 3: textarea / pre / contenteditable
             const textarea = document.querySelector('textarea, pre, [contenteditable]');
             if (textarea) {
                 const t = (textarea.innerText || textarea.textContent || '').trim();
@@ -1311,16 +1402,49 @@ def extract_detail_info(page, page_type: str = "detail") -> dict:
             }
             return '';
         }""")
+
         if notes:
-            info["profile_notes"] = notes
-            log(f"  Profile notes: {notes[:80]}...")
-            # --- 4. 关键词检查 ---
-            keywords = ["fine", "warning", "罚款", "警告"]
-            notes_lower = notes.lower()
-            hits = [kw for kw in keywords if kw in notes_lower]
-            if hits:
-                info["notes_keyword_hit"] = ", ".join(hits)
-                log(f"  Notes 关键词命中: {info['notes_keyword_hit']}")
+            # 过滤 disclaimer / Google Translate / 无关文字
+            # 只保留 profile notes 的正文内容
+            lines = notes.split('\n')
+            clean_lines = []
+            skip_mode = False
+            for line in lines:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                lower = stripped.lower()
+                # 跳过 disclaimer / 免责声明相关行
+                if any(kw in lower for kw in [
+                    'disclaimer', 'privacy notice', 'cookie notice',
+                    'terms of use', 'contact us', 'powered by dow jones',
+                    'linguistic search solutions', '© ', 'copyright',
+                    'google translate', 'translation', 'automatically translated',
+                    'machine translation', '自动翻译', '机器翻译',
+                    '免责声明', '隐私声明', 'cookie声明',
+                ]):
+                    skip_mode = True
+                    continue
+                if skip_mode:
+                    # 一旦进入 disclaimer 区域, 后续行都跳过
+                    continue
+                clean_lines.append(stripped)
+
+            clean_notes = '\n'.join(clean_lines)
+            if clean_notes:
+                info["profile_notes"] = clean_notes
+                log(f"  Profile notes: {clean_notes[:80]}...")
+                # --- 4. 关键词检查 ---
+                keywords = ["fine", "warning", "罚款", "警告"]
+                notes_lower = clean_notes.lower()
+                hits = [kw for kw in keywords if kw in notes_lower]
+                if hits:
+                    info["notes_keyword_hit"] = ", ".join(hits)
+                    log(f"  Notes 关键词命中: {info['notes_keyword_hit']}")
+            else:
+                log(f"  Profile notes: (过滤后为空)")
+        else:
+            log(f"  Profile notes: (未找到)")
     except Exception as e:
         log(f"  提取 profile notes 失败: {e}")
 
@@ -1341,14 +1465,21 @@ def save_detail_pdf(page, input_name: str, result_name: str, profile_id: str, co
 # 单行处理
 # ---------------------------------------------------------------------------
 def process_one(page, row, search_url: str, context=None):
-    """处理单行名单, 返回 summary dict。"""
+    """处理单行名单, 返回 list[dict] (每条记录一行)。
+
+    搜索结果单独一行, 每个详情页单独一行。
+    """
     input_name = row["name"]
     log(f"=== 处理: type={row['type']} name={input_name!r} ===")
-    summary = {
+    records = []  # 每条记录一行
+
+    # 搜索结果行 (无详情页信息)
+    search_record = {
         "type": row["type"],
         "name": input_name,
+        "profile_id": "search result",
         "status": "failed",
-        "pdfs": "",
+        "pdf": "",
         "risk_flags": "",
         "original_script_name": "",
         "profile_notes": "",
@@ -1361,17 +1492,20 @@ def process_one(page, row, search_url: str, context=None):
         select_search_type(page, row["type"])
         fill_name_and_search(page, input_name)
         save_search_result_pdf(page, input_name, context)
-        summary["pdfs"] = f"{sanitize(input_name)} - search result.pdf"
+        search_record["pdf"] = f"{sanitize(input_name)} - search result.pdf"
+        search_record["status"] = "success"
 
         results = detect_results(page)
         if not results:
-            summary["status"] = "no_result"
+            search_record["status"] = "no_result"
             log(f"  无结果, 跳过详情页")
-            return summary
+            records.append(search_record)
+            return records
+
+        # 搜索结果行标记成功
+        records.append(search_record)
 
         log(f"  找到 {len(results)} 个结果, 依次进入详情页")
-        detail_pdfs = []
-        detail_infos = []  # 每个详情页的提取信息
         for idx in range(len(results)):
             # 重新收集以避免 stale locator
             current_results = _collect_result_links(page)
@@ -1420,11 +1554,24 @@ def process_one(page, row, search_url: str, context=None):
             # 提取详情页信息 (risk flag, original script name, profile notes)
             log(f"  提取详情页信息 (profile_id={profile_id})")
             detail_info = extract_detail_info(page, row["type"])
-            detail_infos.append(detail_info)
 
             result_name = extract_result_name(page, clicked_text)
             detail_pdf = save_detail_pdf(page, input_name, result_name, profile_id, context)
-            detail_pdfs.append(detail_pdf.name)
+
+            # 每个详情页单独一行
+            detail_record = {
+                "type": row["type"],
+                "name": input_name,
+                "profile_id": profile_id,
+                "status": "success",
+                "pdf": detail_pdf.name,
+                "risk_flags": detail_info["risk_flags"],
+                "original_script_name": detail_info["original_script_name"],
+                "profile_notes": detail_info["profile_notes"],
+                "notes_keyword_hit": detail_info["notes_keyword_hit"],
+                "error": "",
+            }
+            records.append(detail_record)
 
             # 返回结果页以便点击下一项 (若仍有)
             if idx < len(current_results) - 1:
@@ -1441,21 +1588,17 @@ def process_one(page, row, search_url: str, context=None):
                     select_search_type(page, row["type"])
                     fill_name_and_search(page, input_name)
 
-        # 合并多个详情页的提取信息 (用 " | " 分隔)
-        if detail_infos:
-            summary["risk_flags"] = " | ".join(di["risk_flags"] for di in detail_infos if di["risk_flags"])
-            summary["original_script_name"] = " | ".join(di["original_script_name"] for di in detail_infos if di["original_script_name"])
-            summary["profile_notes"] = " | ".join(di["profile_notes"] for di in detail_infos if di["profile_notes"])
-            summary["notes_keyword_hit"] = " | ".join(di["notes_keyword_hit"] for di in detail_infos if di["notes_keyword_hit"])
-
-        summary["status"] = "success"
-        summary["pdfs"] = summary["pdfs"] + "; " + "; ".join(detail_pdfs)
-        return summary
+        return records
 
     except Exception as e:
-        summary["error"] = f"{type(e).__name__}: {e}"
-        log(f"  处理失败: {summary['error']}")
-        return summary
+        err = f"{type(e).__name__}: {e}"
+        log(f"  处理失败: {err}")
+        if not records:
+            search_record["error"] = err
+            records.append(search_record)
+        else:
+            records[-1]["error"] = err
+        return records
 
 
 # ---------------------------------------------------------------------------
@@ -1464,22 +1607,36 @@ def process_one(page, row, search_url: str, context=None):
 def write_summary(records, path: Path):
     # 用 utf-8-sig (带 BOM) 写入, Excel 打开不乱码
     fieldnames = [
-        "type", "name", "status", "pdfs",
+        "type", "name", "profile_id", "status", "pdf",
         "risk_flags", "original_script_name", "profile_notes", "notes_keyword_hit",
         "error",
     ]
+    # records 是 list[list[dict]] (每行名单产生多条记录), 展平
+    flat = []
+    for sublist in records:
+        if isinstance(sublist, list):
+            flat.extend(sublist)
+        elif isinstance(sublist, dict):
+            flat.append(sublist)
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
-        for r in records:
+        for r in flat:
             writer.writerow(r)
 
 
 def print_stats(records):
-    s = sum(1 for r in records if r["status"] == "success")
-    n = sum(1 for r in records if r["status"] == "no_result")
-    fail = sum(1 for r in records if r["status"] == "failed")
-    log(f"=== 汇总: 成功 {s} 条 / 无结果 {n} 条 / 失败 {fail} 条 (共 {len(records)} 条) ===")
+    # records 是 list[list[dict]], 展平后统计
+    flat = []
+    for sublist in records:
+        if isinstance(sublist, list):
+            flat.extend(sublist)
+        elif isinstance(sublist, dict):
+            flat.append(sublist)
+    s = sum(1 for r in flat if r.get("status") == "success")
+    n = sum(1 for r in flat if r.get("status") == "no_result")
+    fail = sum(1 for r in flat if r.get("status") == "failed")
+    log(f"=== 汇总: 成功 {s} 条 / 无结果 {n} 条 / 失败 {fail} 条 (共 {len(flat)} 条) ===")
 
 
 # ---------------------------------------------------------------------------
@@ -1564,11 +1721,13 @@ def main():
         if not login_ok:
             log(f"登录重试耗尽, 终止流程: {last_login_err}")
             for row in rows:
-                records.append({
+                records.append([{
                     "type": row["type"], "name": row["name"],
-                    "status": "failed", "pdfs": "",
+                    "profile_id": "", "status": "failed", "pdf": "",
+                    "risk_flags": "", "original_script_name": "",
+                    "profile_notes": "", "notes_keyword_hit": "",
                     "error": f"login_failed: {last_login_err}",
-                })
+                }])
             write_summary(records, OUTPUT_DIR / "run_summary.csv")
             print_stats(records)
             browser.close()
@@ -1576,8 +1735,8 @@ def main():
 
         # 逐行处理
         for row in rows:
-            rec = process_one(page, row, DJ_ADVANCED_SEARCH_URL, context)
-            records.append(rec)
+            recs = process_one(page, row, DJ_ADVANCED_SEARCH_URL, context)
+            records.append(recs)  # recs 是 list[dict]
 
         browser.close()
 
