@@ -1143,6 +1143,190 @@ def extract_result_name(page, clicked_text: str) -> str:
     return clicked_text
 
 
+def extract_detail_info(page, page_type: str = "detail") -> dict:
+    """从详情页提取 risk flag, original script name, profile notes 等。
+
+    返回 dict:
+      risk_flags: str    - 页面顶部有颜色的 risk flag 标签 (逗号分隔)
+      original_script_name: str - name 栏里的 original script name
+      profile_notes: str  - profile notes 全文
+      notes_keyword_hit: str - profile notes 中是否含关键词 (fine/warning/罚款/警告)
+    """
+    info = {
+        "risk_flags": "",
+        "original_script_name": "",
+        "profile_notes": "",
+        "notes_keyword_hit": "",
+    }
+
+    # --- 1. Risk flags: 页面顶部的有色标签 ---
+    # Risk Center 的 risk flag 常见为带背景色的 badge/tag, 如 "PEP", "Sanction", "Adverse Media"
+    try:
+        flags = page.evaluate("""() => {
+            const results = [];
+            // 方法 1: 查找页面顶部区域 (header/summary) 中的 badge/tag 元素
+            // 常见 class: risk-flag, badge, tag, chip, alert, flag
+            const topArea = document.querySelector(
+                '[class*="risk" i][class*="flag" i], ' +
+                '[class*="summary" i], ' +
+                '[class*="header" i][class*="profile" i], ' +
+                '[data-testid*="risk" i], ' +
+                '[class*="flag" i]'
+            );
+            const root = topArea || document;
+            // 查找带背景色的 badge 元素
+            const candidates = root.querySelectorAll(
+                '[class*="badge" i], [class*="tag" i], [class*="chip" i], ' +
+                '[class*="flag" i], [class*="alert" i], [class*="risk" i], ' +
+                '[class*="pill" i], [class*="label" i][class*="risk" i]'
+            );
+            for (const el of candidates) {
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 10 || rect.height < 5) continue;
+                if (el.offsetParent === null) continue;
+                const t = (el.innerText || el.textContent || '').trim();
+                if (t && t.length < 50 && !results.includes(t)) {
+                    // 排除通用 UI 文字
+                    const lower = t.toLowerCase();
+                    if (lower === 'risk' || lower === 'flags' || lower === 'risk flags') continue;
+                    results.push(t);
+                }
+            }
+            // 方法 2: 如果方法 1 没找到, 全局搜索带背景色的 span/div
+            if (results.length === 0) {
+                const allTags = document.querySelectorAll('span, div, p');
+                for (const el of allTags) {
+                    const style = window.getComputedStyle(el);
+                    const bg = style.backgroundColor;
+                    // 检查是否有非透明背景色 (rgb 格式, 非 transparent)
+                    if (bg && bg !== 'transparent' && bg !== 'rgba(0, 0, 0, 0)') {
+                        const rect = el.getBoundingClientRect();
+                        // 只找小标签 (宽度 < 200, 高度 < 40)
+                        if (rect.width > 15 && rect.width < 200 &&
+                            rect.height > 10 && rect.height < 40 &&
+                            el.offsetParent !== null) {
+                            const t = (el.innerText || '').trim();
+                            if (t && t.length < 50 && !results.includes(t)) {
+                                const lower = t.toLowerCase();
+                                if (lower === 'risk' || lower === 'flags' || lower === 'risk flags') continue;
+                                // 检查是否在顶部区域 (y < 500)
+                                if (rect.top < 500) {
+                                    results.push(t);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return results;
+        }""")
+        if flags:
+            info["risk_flags"] = ", ".join(flags)
+            log(f"  Risk flags: {info['risk_flags']}")
+    except Exception as e:
+        log(f"  提取 risk flags 失败: {e}")
+
+    # --- 2. Original script name: name 栏里的 original script name ---
+    try:
+        script_name = page.evaluate("""() => {
+            // 查找 "Original Script Name" 或 "Also Known As" 或 "Original Name" 附近文本
+            const labels = ['Original Script Name', 'Original Name', 'Also Known As',
+                            'Original Script', '原文名', '别名'];
+            const allEls = document.querySelectorAll('dt, dd, th, td, span, div, p, label');
+            for (const el of allEls) {
+                const t = (el.innerText || el.textContent || '').trim();
+                for (const label of labels) {
+                    if (t.toLowerCase().startsWith(label.toLowerCase())) {
+                        // 提取冒号后的值
+                        const m = t.match(/[:：]\\s*(.+)/);
+                        if (m) return m[1].trim();
+                        // 或者查找下一个兄弟元素
+                        const next = el.nextElementSibling;
+                        if (next) {
+                            const v = (next.innerText || next.textContent || '').trim();
+                            if (v) return v;
+                        }
+                    }
+                }
+            }
+            // 方法 2: 查找包含 "original" 或 "script" 的 data-testid
+            const testIds = document.querySelectorAll('[data-testid*="original" i], [data-testid*="script" i]');
+            for (const el of testIds) {
+                const t = (el.innerText || el.textContent || '').trim();
+                if (t) return t.substring(0, 200);
+            }
+            return '';
+        }""")
+        if script_name:
+            info["original_script_name"] = script_name
+            log(f"  Original script name: {script_name}")
+    except Exception as e:
+        log(f"  提取 original script name 失败: {e}")
+
+    # --- 3. Profile notes ---
+    try:
+        notes = page.evaluate("""() => {
+            // 查找 Profile Notes 区域
+            const labels = ['Profile Notes', 'profile notes', 'PROFILE NOTES', 'Notes'];
+            // 方法 1: 查找标题/标签元素, 然后取相邻的内容区域
+            const allEls = document.querySelectorAll('h1, h2, h3, h4, h5, h6, dt, th, span, div, p, label');
+            for (const el of allEls) {
+                const t = (el.innerText || el.textContent || '').trim();
+                for (const label of labels) {
+                    if (t === label || t.toLowerCase() === label.toLowerCase()) {
+                        // 查找下一个兄弟元素或父元素的下一个子元素
+                        let next = el.nextElementSibling;
+                        if (next) {
+                            const v = (next.innerText || next.textContent || '').trim();
+                            if (v && v.length > 5) return v;
+                        }
+                        // 查找父元素的下一个兄弟
+                        const parent = el.parentElement;
+                        if (parent) {
+                            const pnext = parent.nextElementSibling;
+                            if (pnext) {
+                                const v = (pnext.innerText || pnext.textContent || '').trim();
+                                if (v && v.length > 5) return v;
+                            }
+                        }
+                        // 或者在同一元素中提取冒号后的内容
+                        const m = t.match(/[:：]\\s*(.+)/s);
+                        if (m) return m[1].trim();
+                    }
+                }
+            }
+            // 方法 2: data-testid
+            const noteEls = document.querySelectorAll(
+                '[data-testid*="note" i], [class*="profile-note" i], [class*="note" i][class*="content" i]'
+            );
+            for (const el of noteEls) {
+                const t = (el.innerText || el.textContent || '').trim();
+                if (t && t.length > 10) return t;
+            }
+            // 方法 3: 查找 textarea 或 pre 元素 (notes 可能是可编辑区域)
+            const textarea = document.querySelector('textarea, pre, [contenteditable]');
+            if (textarea) {
+                const t = (textarea.innerText || textarea.textContent || '').trim();
+                if (t && t.length > 10) return t;
+            }
+            return '';
+        }""")
+        if notes:
+            info["profile_notes"] = notes
+            log(f"  Profile notes: {notes[:80]}...")
+            # --- 4. 关键词检查 ---
+            keywords = ["fine", "warning", "罚款", "警告"]
+            notes_lower = notes.lower()
+            hits = [kw for kw in keywords if kw in notes_lower]
+            if hits:
+                info["notes_keyword_hit"] = ", ".join(hits)
+                log(f"  Notes 关键词命中: {info['notes_keyword_hit']}")
+    except Exception as e:
+        log(f"  提取 profile notes 失败: {e}")
+
+    return info
+
+
 def save_detail_pdf(page, input_name: str, result_name: str, profile_id: str, context=None) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     # 用 input_name (模板输入名) 命名, 与 search result PDF 保持一致
@@ -1165,6 +1349,10 @@ def process_one(page, row, search_url: str, context=None):
         "name": input_name,
         "status": "failed",
         "pdfs": "",
+        "risk_flags": "",
+        "original_script_name": "",
+        "profile_notes": "",
+        "notes_keyword_hit": "",
         "error": "",
     }
 
@@ -1183,6 +1371,7 @@ def process_one(page, row, search_url: str, context=None):
 
         log(f"  找到 {len(results)} 个结果, 依次进入详情页")
         detail_pdfs = []
+        detail_infos = []  # 每个详情页的提取信息
         for idx in range(len(results)):
             # 重新收集以避免 stale locator
             current_results = _collect_result_links(page)
@@ -1228,6 +1417,11 @@ def process_one(page, row, search_url: str, context=None):
                     fill_name_and_search(page, input_name)
                 continue
 
+            # 提取详情页信息 (risk flag, original script name, profile notes)
+            log(f"  提取详情页信息 (profile_id={profile_id})")
+            detail_info = extract_detail_info(page, row["type"])
+            detail_infos.append(detail_info)
+
             result_name = extract_result_name(page, clicked_text)
             detail_pdf = save_detail_pdf(page, input_name, result_name, profile_id, context)
             detail_pdfs.append(detail_pdf.name)
@@ -1247,6 +1441,13 @@ def process_one(page, row, search_url: str, context=None):
                     select_search_type(page, row["type"])
                     fill_name_and_search(page, input_name)
 
+        # 合并多个详情页的提取信息 (用 " | " 分隔)
+        if detail_infos:
+            summary["risk_flags"] = " | ".join(di["risk_flags"] for di in detail_infos if di["risk_flags"])
+            summary["original_script_name"] = " | ".join(di["original_script_name"] for di in detail_infos if di["original_script_name"])
+            summary["profile_notes"] = " | ".join(di["profile_notes"] for di in detail_infos if di["profile_notes"])
+            summary["notes_keyword_hit"] = " | ".join(di["notes_keyword_hit"] for di in detail_infos if di["notes_keyword_hit"])
+
         summary["status"] = "success"
         summary["pdfs"] = summary["pdfs"] + "; " + "; ".join(detail_pdfs)
         return summary
@@ -1262,10 +1463,13 @@ def process_one(page, row, search_url: str, context=None):
 # ---------------------------------------------------------------------------
 def write_summary(records, path: Path):
     # 用 utf-8-sig (带 BOM) 写入, Excel 打开不乱码
+    fieldnames = [
+        "type", "name", "status", "pdfs",
+        "risk_flags", "original_script_name", "profile_notes", "notes_keyword_hit",
+        "error",
+    ]
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(
-            f, fieldnames=["type", "name", "status", "pdfs", "error"]
-        )
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for r in records:
             writer.writerow(r)
