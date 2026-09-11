@@ -1147,9 +1147,9 @@ def extract_detail_info(page, page_type: str = "detail") -> dict:
     """从详情页提取 risk flag, original script name, profile notes 等。
 
     返回 dict:
-      risk_flags: str    - 页面顶部有颜色的 risk flag 标签 (逗号分隔)
-      original_script_name: str - name 栏里的 original script name
-      profile_notes: str  - profile notes 正文内容
+      risk_flags: str    - 页面顶部的 risk flag 标签 (如 OOL, PEP)
+      original_script_name: str - name 栏表格中 ORIGINAL SCRIPT NAME 列的值
+      profile_notes: str  - profile notes 正文内容 (不含翻译控件/disclaimer)
       notes_keyword_hit: str - profile notes 中是否含关键词 (fine/warning/罚款/警告)
     """
     info = {
@@ -1159,127 +1159,102 @@ def extract_detail_info(page, page_type: str = "detail") -> dict:
         "notes_keyword_hit": "",
     }
 
-    # 诊断: dump 详情页上方区域所有带背景色的小元素 (调试 risk flag 提取)
+    # 诊断: dump 详情页上方区域所有小元素 (调试 risk flag)
     try:
         debug_flags = page.evaluate("""() => {
             const results = [];
-            const allEls = document.querySelectorAll('span, div, p, a, button, li');
+            const allEls = document.querySelectorAll('span, div, p, a, li');
             for (const el of allEls) {
                 const rect = el.getBoundingClientRect();
                 if (rect.width < 10 || rect.width > 300) continue;
                 if (rect.height < 8 || rect.height > 50) continue;
                 if (el.offsetParent === null) continue;
-                if (rect.top > 600) continue;
-                const style = window.getComputedStyle(el);
-                const bg = style.backgroundColor;
-                if (!bg || bg === 'transparent' || bg === 'rgba(0, 0, 0, 0)') continue;
+                if (rect.top > 400) continue;
                 const t = (el.innerText || el.textContent || '').trim();
                 if (t && t.length > 0 && t.length < 50) {
+                    const style = window.getComputedStyle(el);
                     results.push({
                         text: t.substring(0, 30),
-                        bg: bg,
                         top: Math.round(rect.top),
-                        w: Math.round(rect.width),
-                        h: Math.round(rect.height),
-                        cls: (el.className || '').toString().substring(0, 40),
+                        bg: style.backgroundColor,
+                        border: style.borderColor,
+                        cls: (el.className || '').toString().substring(0, 50),
                     });
                 }
             }
-            return results;
+            return results.slice(0, 15);
         }""")
         if debug_flags:
-            log(f"  [debug] 页面上方带背景色的小元素: {debug_flags[:10]}")
+            log(f"  [debug] 页面上方小元素 (含无边框): {debug_flags[:15]}")
     except Exception:
         pass
 
-    # 诊断: dump 含 "Original Script" 或 "Profile Notes" 的元素结构
-    try:
-        debug_fields = page.evaluate("""() => {
-            const results = [];
-            const allEls = document.querySelectorAll('*');
-            for (const el of allEls) {
-                const t = (el.innerText || el.textContent || '').trim();
-                if (t.length > 100) continue;
-                if (t.toLowerCase().includes('original script') ||
-                    t.toLowerCase().includes('profile notes')) {
-                    const parent = el.parentElement;
-                    const sibling = el.nextElementSibling;
-                    results.push({
-                        text: t.substring(0, 60),
-                        tag: el.tagName,
-                        cls: (el.className || '').toString().substring(0, 40),
-                        parentCls: parent ? (parent.className || '').toString().substring(0, 40) : '',
-                        siblingText: sibling ? (sibling.innerText || '').substring(0, 40) : '',
-                    });
-                }
-            }
-            return results.slice(0, 5);
-        }""")
-        if debug_fields:
-            log(f"  [debug] Original Script/Profile Notes 相关元素: {debug_fields}")
-    except Exception:
-        pass
-
-    # --- 1. Risk flags: 页面顶部有颜色的标签 (如 OOL, PEP, Sanction, AM) ---
+    # --- 1. Risk flags ---
+    # Dow Jones 详情页顶部的 risk flag (如 OOL, PEP, AM, SEM, SL, FEC)
+    # 可能是带背景色/边框色的标签, 也可能是纯文字标签
+    # 策略: 在页面上方区域 (top < 400) 找已知的 risk flag 缩写, 或找有颜色的标签
     try:
         flags = page.evaluate("""() => {
+            // 已知的 Dow Jones Risk Center risk flag 缩写
+            const knownFlags = ['OOL', 'PEP', 'AM', 'SEM', 'SL', 'FEC', 'REL', 'POI',
+                'SIP', 'SAN', 'SOC', 'PEP', 'OEL', 'DEL', 'SOCM', 'SANCTION',
+                'Adverse Media', 'Sanctions', 'State-Owned', 'Regulatory',
+                'Financial Crime', 'Law Enforcement', 'Politically Exposed',
+                'Other Excluded', 'Special Interest', 'Sanctioned Entity'];
+
             const results = [];
             const seen = new Set();
-
-            // Dow Jones Risk Center 的 risk flag 是页面上方的小标签,
-            // 通常是有背景色的 span/div, 文字短 (如 "OOL", "PEP", "AM")
-            // 搜索策略: 找所有有非透明背景色的小元素 (位于页面上方)
-
-            const allEls = document.querySelectorAll('span, div, p, a, button, li');
+            const allEls = document.querySelectorAll('span, div, p, a, li, td, th');
             for (const el of allEls) {
                 const rect = el.getBoundingClientRect();
-                if (rect.width < 15 || rect.width > 200) continue;
-                if (rect.height < 10 || rect.height > 40) continue;
+                if (rect.width < 10 || rect.width > 300) continue;
+                if (rect.height < 8 || rect.height > 50) continue;
                 if (el.offsetParent === null) continue;
                 // 只看页面上方区域
-                if (rect.top > 600) continue;
-
-                const style = window.getComputedStyle(el);
-                const bg = style.backgroundColor;
-                const bgImg = style.backgroundImage;
-
-                // 必须有非透明背景色 (排除白色背景)
-                const hasBgColor = bg && bg !== 'transparent' &&
-                    bg !== 'rgba(0, 0, 0, 0)' &&
-                    !bg.includes('rgba(255, 255, 255') &&
-                    !bg.includes('rgb(255, 255, 255');
-
-                if (!hasBgColor) continue;
+                if (rect.top > 400) continue;
 
                 const t = (el.innerText || el.textContent || '').trim();
-                if (!t || t.length === 0 || t.length > 30) continue;
+                if (!t || t.length === 0 || t.length > 50) continue;
 
-                // 排除通用 UI 文字
+                // 排除通用 UI 文字和状态标签
                 const lower = t.toLowerCase();
-                if (lower === 'risk' || lower === 'flags' || lower === 'risk flags' ||
+                if (lower === 'active' || lower === 'inactive' ||
                     lower === 'search' || lower === 'download' || lower === 'print' ||
-                    lower === 'email' || lower === 'modify search' ||
-                    lower === 'search summary' || lower === 'simple search' ||
-                    lower === 'advanced search' || lower === 'continue' ||
+                    lower === 'email' || lower === 'continue' ||
                     lower === 'ok' || lower === 'cancel' || lower === 'close' ||
                     lower.includes('disclaimer') || lower.includes('privacy') ||
-                    lower.includes('cookie') || lower.includes('terms')) continue;
+                    lower.includes('cookie') || lower.includes('terms') ||
+                    lower === 'risk' || lower === 'flags' || lower === 'risk flags') continue;
 
-                // 排除子元素已包含的情况 (避免重复)
-                let parent = el.parentElement;
-                let isChildOfExisting = false;
-                while (parent && !isChildOfExisting) {
-                    if (seen.has(parent)) isChildOfExisting = true;
-                    parent = parent.parentElement;
+                // 方法 1: 精确匹配已知 risk flag
+                const isKnown = knownFlags.some(f =>
+                    t === f || t.toLowerCase() === f.toLowerCase());
+                if (isKnown && !seen.has(t)) {
+                    seen.add(t);
+                    results.push(t);
+                    continue;
                 }
 
-                if (!isChildOfExisting && !seen.has(el)) {
-                    seen.add(el);
+                // 方法 2: 有背景色或边框色的小标签 (排除白色/透明)
+                const style = window.getComputedStyle(el);
+                const bg = style.backgroundColor;
+                const border = style.borderTopColor;
+                const hasBgColor = bg && bg !== 'transparent' &&
+                    bg !== 'rgba(0, 0, 0, 0)' &&
+                    !bg.includes('255, 255, 255');
+                const hasBorder = border && border !== 'transparent' &&
+                    border !== 'rgba(0, 0, 0, 0)' &&
+                    !border.includes('255, 255, 255') &&
+                    style.borderTopWidth !== '0px';
+
+                if ((hasBgColor || hasBorder) && !seen.has(t) && t.length <= 20) {
+                    seen.add(t);
                     results.push(t);
                 }
             }
 
-            return results;
+            // 去重
+            return [...new Set(results)];
         }""")
         if flags:
             info["risk_flags"] = ", ".join(flags)
@@ -1289,62 +1264,66 @@ def extract_detail_info(page, page_type: str = "detail") -> dict:
     except Exception as e:
         log(f"  提取 risk flags 失败: {e}")
 
-    # --- 2. Original script name ---
-    # Dow Jones 详情页有 "Original Script Name" 字段, 显示非罗马字符的原文名
+    # --- 2. Original script name (从表格中提取) ---
+    # 页面 name 栏是一个 TABLE, 表头 THEAD/TR/TH 中有 "ORIGINAL SCRIPT NAME"
+    # 数据行 TR/TD 中对应列即为原文名 (如 "王新宇")
     try:
         script_name = page.evaluate("""() => {
-            // 方法 1: 精确匹配 "Original Script Name" 标签
-            const allEls = document.querySelectorAll('*');
-            for (const el of allEls) {
-                const t = (el.innerText || el.textContent || '').trim();
-                // 精确匹配标签文字 (不是包含, 是等于或以该文字开头)
-                if (t === 'Original Script Name' || t === 'Original Name' ||
-                    t === 'Original Script' || t === 'Also Known As') {
-                    // 找到了标签, 查找相邻的值元素
-                    // 方式 a: 下一个兄弟元素
-                    let next = el.nextElementSibling;
-                    if (next) {
-                        const v = (next.innerText || next.textContent || '').trim();
-                        if (v && v !== t) return v;
+            // 方法 1: 在表格中找到 ORIGINAL SCRIPT NAME 列, 提取对应行的值
+            const tables = document.querySelectorAll('table');
+            for (const table of tables) {
+                const headerRow = table.querySelector('thead tr, tr:first-child');
+                if (!headerRow) continue;
+                const headers = headerRow.querySelectorAll('th, td');
+                let targetIdx = -1;
+                headers.forEach((th, i) => {
+                    const t = (th.innerText || th.textContent || '').trim().toLowerCase();
+                    if (t.includes('original script') || t === 'original script name') {
+                        targetIdx = i;
                     }
-                    // 方式 b: 父元素的下一个兄弟
-                    const parent = el.parentElement;
-                    if (parent) {
-                        const pnext = parent.nextElementSibling;
-                        if (pnext) {
-                            const v = (pnext.innerText || pnext.textContent || '').trim();
-                            if (v && v !== t) return v;
-                        }
-                        // 方式 c: 父元素内的其他子元素
-                        const siblings = parent.children;
-                        for (const sib of siblings) {
-                            if (sib === el) continue;
-                            const v = (sib.innerText || sib.textContent || '').trim();
-                            if (v && v !== t) return v;
+                });
+                if (targetIdx >= 0) {
+                    // 找到数据行 (非表头行)
+                    const dataRows = table.querySelectorAll('tbody tr, tr:not(:first-child)');
+                    for (const row of dataRows) {
+                        const cells = row.querySelectorAll('td');
+                        if (cells.length > targetIdx) {
+                            const val = (cells[targetIdx].innerText || cells[targetIdx].textContent || '').trim();
+                            if (val && val.length > 0 && val.length < 200) return val;
                         }
                     }
-                    // 方式 d: 同元素中冒号后的内容
-                    const m = t.match(/[:：]\\s*(.+)/);
-                    if (m) return m[1].trim();
                 }
             }
-            // 方法 2: 查找包含 "original script" 的 data-testid 或 data-label
-            const labeled = document.querySelectorAll(
-                '[data-testid*="original" i], [data-testid*="script" i], ' +
-                '[data-label*="original" i], [data-field*="original" i]'
-            );
-            for (const el of labeled) {
-                const t = (el.innerText || el.textContent || '').trim();
-                // 尝试提取标签后的值
-                const m = t.match(/Original Script Name[:：]?\\s*(.+)/i);
-                if (m) return m[1].trim();
-                // 如果元素本身不是标签而是值
-                if (t && !t.toLowerCase().includes('original script name')) return t.substring(0, 200);
-            }
-            // 方法 3: 查找含 "Original Script Name" 文本的元素, 用正则提取冒号后的值
+            // 方法 2: 全文正则匹配
             const allText = document.body.innerText || '';
-            const m2 = allText.match(/Original Script Name\\s*[:：]?\\s*([^\\n\\r]+)/i);
-            if (m2) return m2[1].trim();
+            // 匹配 "ORIGINAL SCRIPT NAME" 后面的值 (可能在同一行或下一行)
+            const lines = allText.split('\\n');
+            for (let i = 0; i < lines.length; i++) {
+                if (lines[i].toLowerCase().includes('original script name')) {
+                    // 检查同行是否有值
+                    const parts = lines[i].split('\\t');
+                    const idx = parts.findIndex(p => p.toLowerCase().includes('original script'));
+                    if (idx >= 0 && parts.length > idx + 1 && parts[idx + 1].trim()) {
+                        return parts[idx + 1].trim();
+                    }
+                    // 检查下一行
+                    if (i + 1 < lines.length && lines[i + 1].trim()) {
+                        // 下一行可能是 tab 分隔的值行
+                        const nextParts = lines[i + 1].split('\\t');
+                        for (const p of nextParts) {
+                            const v = p.trim();
+                            // 排除 "Primary Name" 等标签和空值
+                            if (v && !v.toLowerCase().includes('primary') &&
+                                !v.toLowerCase().includes('name') &&
+                                v.length > 0 && v.length < 100 &&
+                                // 原文名通常是非 ASCII 字符 (中文、阿拉伯文等)
+                                /[^\\x00-\\x7F]/.test(v)) {
+                                return v;
+                            }
+                        }
+                    }
+                }
+            }
             return '';
         }""")
         if script_name:
@@ -1355,57 +1334,89 @@ def extract_detail_info(page, page_type: str = "detail") -> dict:
     except Exception as e:
         log(f"  提取 original script name 失败: {e}")
 
-    # --- 3. Profile notes (只保留正文, 过滤 disclaimer/翻译文字) ---
+    # --- 3. Profile notes (只保留正文, 过滤翻译控件/disclaimer) ---
+    # Profile Notes 区域结构: 标题 "Profile Notes" (BUTTON/DIV) → 正文内容 → 翻译控件
+    # 需要跳过 "Translate to:", "English", "Translate", "powered by..." 等翻译 UI
     try:
         notes = page.evaluate("""() => {
-            // 方法 1: 精确匹配 "Profile Notes" 标签, 取相邻内容
+            // 方法 1: 找 "Profile Notes" 标题元素, 向上找父容器, 再在父容器中提取正文
             const allEls = document.querySelectorAll('*');
+            let notesContainer = null;
             for (const el of allEls) {
                 const t = (el.innerText || el.textContent || '').trim();
                 if (t === 'Profile Notes' || t === 'PROFILE NOTES') {
-                    // 找到了标签, 查找相邻的值元素
-                    let next = el.nextElementSibling;
-                    if (next) {
-                        const v = (next.innerText || next.textContent || '').trim();
-                        if (v && v.length > 5) return v;
+                    // 向上查找包含正文内容的父容器
+                    let parent = el.parentElement;
+                    for (let i = 0; i < 5 && parent; i++) {
+                        const fullText = (parent.innerText || parent.textContent || '').trim();
+                        // 父容器应该比标题本身长很多 (包含正文)
+                        if (fullText.length > 50) {
+                            notesContainer = parent;
+                            break;
+                        }
+                        parent = parent.parentElement;
                     }
+                    if (notesContainer) break;
+                }
+            }
+
+            if (notesContainer) {
+                // 提取 notesContainer 中所有文本节点, 过滤翻译控件
+                const allText = (notesContainer.innerText || notesContainer.textContent || '').trim();
+                // 过滤翻译控件文字
+                const lines = allText.split('\\n');
+                const cleanLines = [];
+                let foundTranslateUI = false;
+                for (const line of lines) {
+                    const stripped = line.trim();
+                    if (!stripped) continue;
+                    const lower = stripped.toLowerCase();
+                    // 跳过 "Profile Notes" 标题本身
+                    if (lower === 'profile notes' || lower === 'profile notes') continue;
+                    // 遇到翻译控件, 标记并跳过后续
+                    if (lower.includes('translate to') || lower.includes('powered by') ||
+                        lower === 'english' || lower === 'translate' ||
+                        lower.includes('google') || lower.includes('machine translation')) {
+                        foundTranslateUI = true;
+                        continue;
+                    }
+                    if (foundTranslateUI) continue;
+                    cleanLines.push(stripped);
+                }
+                if (cleanLines.length > 0) {
+                    return cleanLines.join('\\n');
+                }
+            }
+
+            // 方法 2: 找 Profile Notes 标题, 取父元素的下一个兄弟
+            for (const el of allEls) {
+                const t = (el.innerText || el.textContent || '').trim();
+                if (t === 'Profile Notes' || t === 'PROFILE NOTES') {
                     const parent = el.parentElement;
                     if (parent) {
                         const pnext = parent.nextElementSibling;
                         if (pnext) {
                             const v = (pnext.innerText || pnext.textContent || '').trim();
-                            if (v && v.length > 5) return v;
-                        }
-                        const siblings = parent.children;
-                        for (const sib of siblings) {
-                            if (sib === el) continue;
-                            const v = (sib.innerText || sib.textContent || '').trim();
-                            if (v && v.length > 5) return v;
+                            if (v && v.length > 10) return v;
                         }
                     }
                 }
             }
-            // 方法 2: data-testid
+
+            // 方法 3: data-testid
             const noteEls = document.querySelectorAll(
                 '[data-testid*="profile-note" i], [data-testid*="note" i], ' +
-                '[class*="profile-note" i], [class*="note" i][class*="content" i]'
+                '[class*="profile-note" i]'
             );
             for (const el of noteEls) {
                 const t = (el.innerText || el.textContent || '').trim();
-                if (t && t.length > 10) return t;
-            }
-            // 方法 3: textarea / pre / contenteditable
-            const textarea = document.querySelector('textarea, pre, [contenteditable]');
-            if (textarea) {
-                const t = (textarea.innerText || textarea.textContent || '').trim();
                 if (t && t.length > 10) return t;
             }
             return '';
         }""")
 
         if notes:
-            # 过滤 disclaimer / Google Translate / 无关文字
-            # 只保留 profile notes 的正文内容
+            # 再次过滤 (双重保险)
             lines = notes.split('\n')
             clean_lines = []
             skip_mode = False
@@ -1414,19 +1425,19 @@ def extract_detail_info(page, page_type: str = "detail") -> dict:
                 if not stripped:
                     continue
                 lower = stripped.lower()
-                # 跳过 disclaimer / 免责声明相关行
                 if any(kw in lower for kw in [
                     'disclaimer', 'privacy notice', 'cookie notice',
                     'terms of use', 'contact us', 'powered by dow jones',
                     'linguistic search solutions', '© ', 'copyright',
                     'google translate', 'translation', 'automatically translated',
-                    'machine translation', '自动翻译', '机器翻译',
+                    'machine translation', 'translate to', 'powered by',
+                    'english', 'translate',
+                    '自动翻译', '机器翻译',
                     '免责声明', '隐私声明', 'cookie声明',
                 ]):
                     skip_mode = True
                     continue
                 if skip_mode:
-                    # 一旦进入 disclaimer 区域, 后续行都跳过
                     continue
                 clean_lines.append(stripped)
 
